@@ -1,0 +1,13 @@
+{
+  "name": "LoogaSoft.Terrain.Instances",
+  "rootNamespace": "LoogaSoft.Terrain.Instances",
+  "references": [
+    "Unity.Collections",
+    "Unity.RenderPipelines.Core.Runtime",
+    "Unity.Burst",
+    "Unity.Mathematics",
+    "LoogaSoft.Instancing"
+  ],
+  "allowUnsafeCode": true,
+  "autoReferenced": true
+}

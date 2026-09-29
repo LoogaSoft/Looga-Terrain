@@ -1,0 +1,12 @@
+#pragma kernel SampleGeometry
+#include "../../Runtime/Shaders/TerrainGeometry.hlsl"
+RWStructuredBuffer<float2> _Vertices;
+uint _SelectedCount;
+[numthreads(64, 1, 1)]
+void SampleGeometry(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _SelectedCount * 289) return;
+    uint vertex = id.x % 289;
+    float2 grid = float2(vertex % 17, vertex / 17) / 16.0;
+    _Vertices[id.x] = LoogaPatchUV(grid, id.x / 289);
+}

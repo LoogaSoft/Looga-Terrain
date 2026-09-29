@@ -1,0 +1,470 @@
+#pragma kernel SelectPatches
+#pragma kernel BuildNodeData
+#pragma kernel ClearNodeData
+#pragma kernel ClearNodeRegion
+#pragma kernel CopyBatchNodes
+#pragma kernel ResetBatchArguments
+#pragma kernel SelectBatch BATCH_SELECTION
+#pragma kernel CullDepthBatch BATCH_SELECTION
+#pragma kernel ResetVisibleArguments
+#pragma kernel ReduceDepth
+#pragma kernel CullShadowBatch BATCH_SELECTION
+#pragma kernel ResetShadowArguments
+#pragma kernel MergeShadowDraws
+#pragma kernel MergeSurfaceDraws
+
+struct TileParameters
+{
+    float4 origin;
+    float4 size;
+    float4 quality;
+};
+StructuredBuffer<TileParameters> _BatchTiles;
+RWStructuredBuffer<uint4> _BatchNodeData;
+RWStructuredBuffer<uint> _BatchLod;
+RWStructuredBuffer<float4> _BatchVisible;
+RWStructuredBuffer<float4> _BatchShadows;
+RWByteAddressBuffer _BatchVisibleArguments;
+RWByteAddressBuffer _BatchShadowArguments;
+RWStructuredBuffer<uint2> _BatchOcclusionStatistics;
+uint _BatchTileCount;
+uint _BatchNodeOffset;
+uint _BatchIndexCount;
+
+
+AppendStructuredBuffer<float4> _VisiblePatches;
+AppendStructuredBuffer<float4> _ShadowPatches;
+RWStructuredBuffer<uint> _LodMap;
+RWStructuredBuffer<uint4> _NodeData;
+Texture2D<float4> _SourceHeight;
+SamplerState sampler_linear_clamp;
+float4 _TerrainOrigin;
+float4 _TerrainSize;
+cbuffer CameraParameters
+{
+    float4 _CameraPosition;
+    float4 _CameraSettings;
+    float4 _FrustumPlanes[6];
+};
+float _TargetPixels;
+float _ErrorPixels;
+uint _PatchCount;
+int _Cull;
+int _UseError;
+uint _BuildLevel;
+uint _BuildGroups;
+uint2 _BuildOrigin;
+uint2 _BuildExtent;
+uint _NodeCount;
+uint _HeightResolution;
+uint _FixedEdges;
+
+uint NodeIndex(uint2 origin, uint size)
+{
+    uint width = _PatchCount;
+    uint offset = 0;
+    for (uint step = 1; step < size; step <<= 1)
+    {
+        offset += width * width;
+        width >>= 1;
+    }
+    uint2 cell = origin / size;
+    return offset + cell.y * width + cell.x;
+}
+
+float SampleHeight(float2 uv)
+{
+    float2 coordinate = (saturate(uv) * (_HeightResolution - 1) + 0.5) / _HeightResolution;
+    return _SourceHeight.SampleLevel(sampler_linear_clamp, coordinate, 0).r * (65535.0 / 32766.0);
+}
+
+groupshared float3 Reductions[64];
+
+[numthreads(64, 1, 1)]
+void ClearNodeData(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _NodeCount) return;
+    _NodeData[id.x] = uint4(asuint(1.0), 0, 0, 0);
+}
+
+[numthreads(8, 8, 1)]
+void ClearNodeRegion(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= _BuildExtent)) return;
+    uint size = 1u << _BuildLevel;
+    _NodeData[NodeIndex((id.xy + _BuildOrigin) * size, size)] = uint4(asuint(1.0), 0, 0, 0);
+}
+
+// Compute source bounds and triangle interpolation error only after height changes.
+[numthreads(8, 8, 1)]
+void BuildNodeData(uint3 group : SV_GroupID, uint thread : SV_GroupIndex)
+{
+    uint size = 1u << _BuildLevel;
+    uint2 origin = (group.xy / _BuildGroups + _BuildOrigin) * size;
+    uint samples = max(1u, (uint)ceil((float)(_HeightResolution - 1) * size / _PatchCount));
+    float2 minimum = (float2)origin / _PatchCount;
+    float span = (float)size / _PatchCount;
+    float3 value = float3(1, 0, 0);
+    uint2 offset = (group.xy % _BuildGroups) * 64;
+    uint2 side = min(64u, samples - offset) + 1;
+    for (uint index = thread; index < side.x * side.y; index += 64)
+    {
+        float2 fraction = (float2(offset) + float2(index % side.x, index / side.x)) / samples;
+        float height = SampleHeight(minimum + fraction * span);
+        float2 grid = fraction * 16;
+        float2 cell = min(floor(grid), 15);
+        float2 blend = grid - cell;
+        float2 baseUV = minimum + cell * (span / 16);
+        float h00 = SampleHeight(baseUV);
+        float h10 = SampleHeight(baseUV + float2(span / 16, 0));
+        float h01 = SampleHeight(baseUV + float2(0, span / 16));
+        float h11 = SampleHeight(baseUV + span / 16);
+        float approximation = blend.x + blend.y <= 1
+            ? h00 + blend.x * (h10 - h00) + blend.y * (h01 - h00)
+            : h11 + (1 - blend.x) * (h01 - h11) + (1 - blend.y) * (h10 - h11);
+        value.x = min(value.x, height);
+        value.y = max(value.y, height);
+        value.z = max(value.z, abs(height - approximation));
+    }
+    Reductions[thread] = value;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint stride = 32; stride > 0; stride >>= 1)
+    {
+        if (thread < stride)
+        {
+            float3 other = Reductions[thread + stride];
+            Reductions[thread] = float3(min(Reductions[thread].x, other.x),
+                max(Reductions[thread].y, other.y), max(Reductions[thread].z, other.z));
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (thread == 0)
+    {
+        uint address = NodeIndex(origin, size);
+        InterlockedMin(_NodeData[address].x, asuint(Reductions[0].x));
+        InterlockedMax(_NodeData[address].y, asuint(Reductions[0].y));
+        InterlockedMax(_NodeData[address].z, asuint(Reductions[0].z));
+    }
+}
+
+uint4 LoadNode(uint index)
+{
+#ifdef BATCH_SELECTION
+    return _BatchNodeData[index];
+#else
+    return _NodeData[index];
+#endif
+}
+
+void PatchBounds(TileParameters tile, uint nodeOffset, uint2 origin, uint size, out float3 minimum, out float3 maximum)
+{
+    float4 data = asfloat(LoadNode(nodeOffset + NodeIndex(origin, size)));
+    float2 low = tile.origin.xz + (float2)origin / _PatchCount * tile.size.xz;
+    float2 high = low + (float)size / _PatchCount * tile.size.xz;
+    minimum = float3(low.x, tile.origin.y + data.x * tile.size.y - 0.01, low.y);
+    maximum = float3(high.x, tile.origin.y + data.y * tile.size.y + 0.01, high.y);
+}
+
+bool ShouldSplit(TileParameters tile, uint nodeOffset, uint2 origin, uint size)
+{
+    if (size <= 1) return false;
+    bool fixedBoundary = ((_FixedEdges & 1) != 0 && origin.x == 0)
+        || ((_FixedEdges & 2) != 0 && origin.x + size == _PatchCount)
+        || ((_FixedEdges & 4) != 0 && origin.y == 0)
+        || ((_FixedEdges & 8) != 0 && origin.y + size == _PatchCount);
+    if (fixedBoundary) return true;
+    float3 minimum, maximum;
+    PatchBounds(tile, nodeOffset, origin, size, minimum, maximum);
+    float distanceToPatch = _CameraSettings.y != 0 ? 1.0
+        : max(0.01, distance(clamp(_CameraPosition.xyz, minimum, maximum), _CameraPosition.xyz));
+    float metric = tile.quality.z != 0 ? asfloat(LoadNode(nodeOffset + NodeIndex(origin, size)).z) * tile.size.y
+        : max(maximum.x - minimum.x, maximum.z - minimum.z);
+    float threshold = tile.quality.z != 0 ? tile.quality.y : tile.quality.x;
+    return metric * _CameraSettings.x > threshold * distanceToPatch;
+}
+
+void StitchedBounds(TileParameters tile, uint nodeOffset, uint2 origin, uint size,
+    out float3 minimum, out float3 maximum)
+{
+    PatchBounds(tile, nodeOffset, origin, size, minimum, maximum);
+    // Edge collapse only rounds down. Its largest step is one sixteenth of a tile.
+    // This aligned ancestor contains every possible stitched vertex, including cross-tile corners.
+    uint boundSize = max(size, _PatchCount / 16);
+    uint2 boundOrigin = origin / boundSize * boundSize;
+    float4 bound = asfloat(LoadNode(nodeOffset + NodeIndex(boundOrigin, boundSize)));
+    minimum.xz = tile.origin.xz + (float2)boundOrigin / _PatchCount * tile.size.xz;
+    minimum.y = tile.origin.y + bound.x * tile.size.y - 0.01;
+    maximum.y = tile.origin.y + bound.y * tile.size.y + 0.01;
+}
+
+bool IsVisible(TileParameters tile, uint nodeOffset, uint2 origin, uint size)
+{
+    float3 minimum, maximum;
+    StitchedBounds(tile, nodeOffset, origin, size, minimum, maximum);
+    float3 center = (minimum + maximum) * 0.5;
+    float3 extent = (maximum - minimum) * 0.5;
+    for (int plane = 0; plane < 6; plane++)
+    {
+        if (dot(_FrustumPlanes[plane].xyz, center) + _FrustumPlanes[plane].w
+            + dot(abs(_FrustumPlanes[plane].xyz), extent) < 0)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+[numthreads(8, 8, 1)]
+void SelectPatches(uint3 id : SV_DispatchThreadID)
+{
+    TileParameters tile;
+    tile.origin = _TerrainOrigin;
+    tile.size = _TerrainSize;
+    tile.quality = float4(_TargetPixels, _ErrorPixels, _UseError, _Cull);
+    uint nodeOffset = 0;
+    uint size = _PatchCount;
+    uint2 origin = 0;
+    while (ShouldSplit(tile, nodeOffset, origin, size))
+    {
+        size >>= 1;
+        origin = id.xy / size * size;
+    }
+    _LodMap[id.y * _PatchCount + id.x] = size;
+    if (any(id.xy != origin)) return;
+    float4 patch = float4(origin, size, 0);
+    // Keep offscreen casters until light-space selection is available.
+    _ShadowPatches.Append(patch);
+    if (_Cull == 0 || IsVisible(tile, nodeOffset, origin, size))
+    {
+        _VisiblePatches.Append(patch);
+    }
+}
+
+[numthreads(64, 1, 1)]
+void CopyBatchNodes(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _NodeCount) return;
+    _BatchNodeData[_BatchNodeOffset + id.x] = _NodeData[id.x];
+}
+
+[numthreads(64, 1, 1)]
+void ResetBatchArguments(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _BatchTileCount) return;
+    uint address = id.x * 20;
+    _BatchVisibleArguments.Store4(address, uint4(_BatchIndexCount, 0, 0, 0));
+    _BatchVisibleArguments.Store(address + 16, 0);
+    _BatchShadowArguments.Store4(address, uint4(_BatchIndexCount, 0, 0, 0));
+    _BatchShadowArguments.Store(address + 16, 0);
+}
+
+[numthreads(8, 8, 1)]
+void SelectBatch(uint3 id : SV_DispatchThreadID)
+{
+    TileParameters tile = _BatchTiles[id.z];
+    uint nodeOffset = id.z * _NodeCount;
+    uint patchOffset = id.z * _PatchCount * _PatchCount;
+    uint size = _PatchCount;
+    uint2 origin = 0;
+    while (ShouldSplit(tile, nodeOffset, origin, size))
+    {
+        size >>= 1;
+        origin = id.xy / size * size;
+    }
+    _BatchLod[patchOffset + id.y * _PatchCount + id.x] = size;
+    if (any(id.xy != origin)) return;
+    float4 patch = float4(origin, size, 0);
+    uint index;
+    _BatchShadowArguments.InterlockedAdd(id.z * 20 + 4, 1, index);
+    _BatchShadows[patchOffset + index] = patch;
+    if (tile.quality.w == 0 || IsVisible(tile, nodeOffset, origin, size))
+    {
+        _BatchVisibleArguments.InterlockedAdd(id.z * 20 + 4, 1, index);
+        _BatchVisible[patchOffset + index] = patch;
+    }
+}
+
+Texture2D<float> _DepthSource;
+RWTexture2D<float> _DepthDestination;
+Texture2D<float> _DepthPyramid;
+float4x4 _DepthViewProjection;
+float4 _DepthSize;
+uint2 _DepthSourceSize;
+uint2 _DepthDestinationSize;
+uint _DepthMip;
+uint _ReversedDepth;
+float _DepthBias;
+
+[numthreads(8, 8, 1)]
+void ReduceDepth(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= _DepthDestinationSize)) return;
+    float value = _ReversedDepth != 0 ? 1 : 0;
+    uint2 low = id.xy * 2;
+    // Include the final source row and column when a mip has an odd dimension.
+    uint2 high = min(low + 2, _DepthSourceSize);
+    if (id.x == _DepthDestinationSize.x - 1) high.x = _DepthSourceSize.x;
+    if (id.y == _DepthDestinationSize.y - 1) high.y = _DepthSourceSize.y;
+    for (uint y = low.y; y < high.y; y++)
+    for (uint x = low.x; x < high.x; x++)
+    {
+        float sample = _DepthSource.Load(int3(x, y, _DepthMip));
+        value = _ReversedDepth != 0 ? min(value, sample) : max(value, sample);
+    }
+    _DepthDestination[id.xy] = value;
+}
+
+bool DepthOccluded(float3 minimum, float3 maximum)
+{
+    float2 low = 1, high = 0;
+    float nearest = _ReversedDepth != 0 ? 0 : 1;
+    for (uint corner = 0; corner < 8; corner++)
+    {
+        float3 cornerPosition = float3((corner & 1) != 0 ? maximum.x : minimum.x,
+            (corner & 2) != 0 ? maximum.y : minimum.y, (corner & 4) != 0 ? maximum.z : minimum.z);
+        float4 clip = mul(_DepthViewProjection, float4(cornerPosition, 1));
+        if (clip.w <= 0 || clip.z <= 0 || clip.z >= clip.w) return false;
+        float3 projected = clip.xyz / clip.w;
+        float2 uv = projected.xy * 0.5 + 0.5;
+        // D3D render-target rows start at the top.
+        uv.y = 1 - uv.y;
+        low = min(low, uv);
+        high = max(high, uv);
+        nearest = _ReversedDepth != 0 ? max(nearest, projected.z) : min(nearest, projected.z);
+    }
+    // Test the visible rectangle with a two-pixel guard band.
+    low -= 2 / _DepthSize.xy;
+    high += 2 / _DepthSize.xy;
+    low = saturate(low);
+    high = min(saturate(high), 0.99999994);
+    float mip = min(_DepthSize.z, max(0, floor(log2(max(1, max((high.x-low.x)*_DepthSize.x, (high.y-low.y)*_DepthSize.y)))) - 1));
+    uint2 extent = max(uint2(1, 1), (uint2)_DepthSize.xy >> (uint)mip);
+    // Mip cells use base-pixel blocks. Odd mip edges contain a larger final block.
+    uint2 a = min((uint2)(low * _DepthSize.xy) >> (uint)mip, extent - 1);
+    uint2 b = min((uint2)(high * _DepthSize.xy) >> (uint)mip, extent - 1);
+    float farthest = _ReversedDepth != 0 ? 1 : 0;
+    for (uint y = a.y; y <= b.y; y++)
+    for (uint x = a.x; x <= b.x; x++)
+    {
+        float depth = _DepthPyramid.Load(int3(x, y, (uint)mip));
+        farthest = _ReversedDepth != 0 ? min(farthest, depth) : max(farthest, depth);
+    }
+    return _ReversedDepth != 0 ? nearest < farthest - _DepthBias : nearest > farthest + _DepthBias;
+}
+
+[numthreads(64, 1, 1)]
+void ResetVisibleArguments(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _BatchTileCount) return;
+    // The shadow list is the stable pre-occlusion candidate source. Surface submission batching may
+    // consume or clear visible arguments before this diagnostic reset executes.
+    uint candidates = _BatchShadowArguments.Load(id.x * 20 + 4);
+    _BatchOcclusionStatistics[id.x] = uint2(candidates, 0);
+    _BatchVisibleArguments.Store(id.x * 20 + 4, 0);
+}
+
+[numthreads(64, 1, 1)]
+void CullDepthBatch(uint3 id : SV_DispatchThreadID)
+{
+    uint count = _BatchShadowArguments.Load(id.y * 20 + 4);
+    if (id.x >= count) return;
+    uint offset = id.y * _PatchCount * _PatchCount;
+    float4 patch = _BatchShadows[offset + id.x];
+    TileParameters tile = _BatchTiles[id.y];
+    uint nodeOffset = id.y * _NodeCount;
+    if (tile.quality.w != 0 && !IsVisible(tile, nodeOffset, (uint2)patch.xy, (uint)patch.z)) return;
+    float3 minimum, maximum;
+    StitchedBounds(tile, nodeOffset, (uint2)patch.xy, (uint)patch.z, minimum, maximum);
+    if (DepthOccluded(minimum, maximum)) return;
+    uint index;
+    _BatchVisibleArguments.InterlockedAdd(id.y * 20 + 4, 1, index);
+    uint ignored;
+    InterlockedAdd(_BatchOcclusionStatistics[id.y].y, 1, ignored);
+    _BatchVisible[offset + index] = patch;
+}
+
+StructuredBuffer<float4> _ShadowCandidates;
+float4 _ShadowPlanes[6];
+float4 _ShadowLights[16];
+uint _ShadowLightCount;
+ByteAddressBuffer _ShadowCounts;
+
+bool CanCastIntoView(float3 minimum, float3 maximum)
+{
+    float3 center = (minimum + maximum) * 0.5;
+    float3 extent = (maximum - minimum) * 0.5;
+    for (uint light = 0; light < _ShadowLightCount; light++)
+    {
+        float4 source = _ShadowLights[light];
+        if (source.w > 0)
+        {
+            // Point and spot lights retain every caster inside their range.
+            float3 delta = max(0, abs(source.xyz - center) - extent);
+            if (dot(delta, delta) <= source.w * source.w) return true;
+            continue;
+        }
+        bool reaches = true;
+        for (uint plane = 0; plane < 6; plane++)
+        {
+            float4 equation = _ShadowPlanes[plane];
+            // A directional shadow can extend without a fixed distance along the light rays.
+            if (dot(equation.xyz, source.xyz) > 0) continue;
+            if (dot(equation.xyz, center) + equation.w + dot(abs(equation.xyz), extent) < 0)
+            {
+                reaches = false;
+                break;
+            }
+        }
+        if (reaches) return true;
+    }
+    return false;
+}
+
+[numthreads(64, 1, 1)]
+void ResetShadowArguments(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _BatchTileCount) _BatchShadowArguments.Store(id.x * 20 + 4, 0);
+}
+
+[numthreads(64, 1, 1)]
+void CullShadowBatch(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _ShadowCounts.Load(id.y * 20 + 4)) return;
+    uint offset = id.y * _PatchCount * _PatchCount;
+    float4 patch = _ShadowCandidates[offset + id.x];
+    float3 minimum, maximum;
+    StitchedBounds(_BatchTiles[id.y], id.y * _NodeCount, (uint2)patch.xy, (uint)patch.z, minimum, maximum);
+    if (!CanCastIntoView(minimum, maximum)) return;
+    uint index;
+    _BatchShadowArguments.InterlockedAdd(id.y * 20 + 4, 1, index);
+    _BatchShadows[offset + index] = patch;
+}
+
+StructuredBuffer<int> _DrawSlices;
+StructuredBuffer<uint> _MergeTiles;
+RWStructuredBuffer<float4> _MergedShadows;
+RWByteAddressBuffer _MergedArguments;
+[numthreads(64, 1, 1)]
+void MergeShadowDraws(uint3 id : SV_DispatchThreadID)
+{
+    uint tile = _MergeTiles[id.y];
+    if (_DrawSlices[tile] < 0 || id.x >= _BatchShadowArguments.Load(tile * 20 + 4)) return;
+    float4 patch = _BatchShadows[tile * _PatchCount * _PatchCount + id.x];
+    patch.w = tile;
+    uint index;
+    _MergedArguments.InterlockedAdd(4, 1, index);
+    _MergedShadows[index] = patch;
+}
+
+RWStructuredBuffer<float4> _MergedVisible;
+[numthreads(64, 1, 1)]
+void MergeSurfaceDraws(uint3 id : SV_DispatchThreadID)
+{
+    uint tile = _MergeTiles[id.y];
+    if (_DrawSlices[tile] < 0 || id.x >= _BatchVisibleArguments.Load(tile * 20 + 4)) return;
+    float4 patch = _BatchVisible[tile * _PatchCount * _PatchCount + id.x];
+    patch.w = tile;
+    uint index;
+    _MergedArguments.InterlockedAdd(4, 1, index);
+    _MergedVisible[index] = patch;
+}

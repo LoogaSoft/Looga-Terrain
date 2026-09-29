@@ -1,0 +1,34 @@
+{
+  "name": "LoogaSoft.Terrain.MicroVerse.EditorTests",
+  "rootNamespace": "LoogaSoft.Terrain.Tests",
+  "references": [
+    "LoogaSoft.Terrain.Runtime",
+    "LoogaSoft.Terrain.MicroVerse",
+    "JBooth.MicroVerseCore",
+    "LoogaSoft.Terrain.Instances",
+    "LoogaSoft.Instancing"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "optionalUnityReferences": [
+    "TestAssemblies"
+  ],
+  "autoReferenced": false,
+  "defineConstraints": [
+    "UNITY_INCLUDE_TESTS",
+    "LOOGA_TERRAIN_MICROVERSE"
+  ],
+  "versionDefines": [
+    {
+      "name": "com.jbooth.microverse",
+      "expression": "1.7.0",
+      "define": "LOOGA_TERRAIN_MICROVERSE"
+    },
+    {
+      "name": "com.jbooth.microverse.objects",
+      "expression": "1.7.0",
+      "define": "LOOGA_TERRAIN_MICROVERSE_OBJECTS"
+    }
+  ]
+}

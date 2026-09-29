@@ -1,0 +1,50 @@
+#pragma kernel Clear
+#pragma kernel Count
+#pragma kernel Compact
+
+Texture2D<float2> _Feedback;
+RWStructuredBuffer<uint2> _Hash;
+RWStructuredBuffer<uint2> _Compact;
+RWStructuredBuffer<uint> _Header;
+uint _Capacity;
+uint _EntryCount;
+uint2 _FeedbackSize;
+
+[numthreads(64, 1, 1)]
+void Clear(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _Capacity) _Hash[id.x] = 0;
+    if (id.x < 2) _Header[id.x] = 0;
+}
+
+[numthreads(8, 8, 1)]
+void Count(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= _FeedbackSize)) return;
+    float2 value = _Feedback.Load(int3(id.xy, 0));
+    if (value.x < 1 || value.x > (float)_EntryCount || value.y < 1) return;
+    uint key = ((uint)value.y - 1) * _EntryCount + (uint)value.x;
+    uint slot = (key * 2654435761u) & (_Capacity - 1);
+    for (uint probe = 0; probe < 128; probe++)
+    {
+        uint previous;
+        InterlockedCompareExchange(_Hash[slot].x, 0, key, previous);
+        if (previous == 0 || previous == key)
+        {
+            InterlockedAdd(_Hash[slot].y, 1);
+            return;
+        }
+        slot = (slot + 1) & (_Capacity - 1);
+    }
+    // The CPU falls back to complete pixel feedback if the bounded hash table fills.
+    InterlockedOr(_Header[1], 1);
+}
+
+[numthreads(64, 1, 1)]
+void Compact(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Capacity || _Hash[id.x].x == 0) return;
+    uint index;
+    InterlockedAdd(_Header[0], 1, index);
+    _Compact[index] = _Hash[id.x];
+}

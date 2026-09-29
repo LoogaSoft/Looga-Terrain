@@ -1,0 +1,35 @@
+{
+  "name": "com.loogasoft.loogaterrain",
+  "displayName": "Looga Terrain",
+  "version": "0.1.0-preview.24",
+  "unity": "6000.3",
+  "description": "GPU terrain patch rendering with native TerrainData authoring and optional integrations.",
+  "author": {
+    "name": "LoogaSoft"
+  },
+  "dependencies": {
+    "com.unity.render-pipelines.universal": "17.3.0",
+    "com.unity.burst": "1.8.30",
+    "com.unity.collections": "2.6.8",
+    "com.unity.mathematics": "1.3.3",
+    "com.unity.splines": "2.3.0",
+    "com.loogasoft.loogainstancing": "0.1.0-preview.14",
+    "com.unity.modules.terrain": "1.0.0",
+    "com.unity.modules.terrainphysics": "1.0.0",
+    "com.unity.modules.imageconversion": "1.0.0",
+    "com.unity.modules.screencapture": "1.0.0",
+    "com.loogasoft.loogatoolkit": "2.0.0"
+  },
+  "samples": [
+    {
+      "displayName": "Two Tile Validation",
+      "description": "Create a reversible terrain rendering test with the validation window.",
+      "path": "Samples~/Two Tiles"
+    },
+    {
+      "displayName": "RAM Placement Bridge",
+      "description": "Optional public-event placement masks for installed RAM 3 rivers and lakes. Requires the RAM assembly.",
+      "path": "Samples~/RAM Bridge"
+    }
+  ]
+}

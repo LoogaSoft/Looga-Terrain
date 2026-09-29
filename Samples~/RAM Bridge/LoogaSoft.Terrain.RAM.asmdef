@@ -1,0 +1,9 @@
+{
+  "name": "LoogaSoft.Terrain.RAM",
+  "references": [
+    "LoogaSoft.Terrain.Instances",
+    "RAM",
+    "LoogaSoft.Instancing"
+  ],
+  "autoReferenced": true
+}

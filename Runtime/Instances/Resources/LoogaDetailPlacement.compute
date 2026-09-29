@@ -1,0 +1,150 @@
+#pragma kernel Place
+#pragma target 5.0
+#include "../Shaders/DetailPlacement.hlsl"
+
+// GPU-resident detail placement. It writes world transforms for InstanceRenderer.WriteRanges.
+// The distribution equals the Reference backend of GeneratedVegetationPageSource.
+
+struct PlacementPage
+{
+    uint4 texel;   // First detail texel x and z, layer, unused.
+    uint4 offsets; // First count, first output, output count, unused.
+};
+
+struct PlacementLayer
+{
+    float4 sizes; // Minimum width, maximum width, minimum height, maximum height.
+    uint seed;
+    float holePadding;
+    float alignment;
+    float unused;
+};
+
+struct SourceTransform
+{
+    float4 row0;
+    float4 row1;
+    float4 row2;
+};
+
+StructuredBuffer<PlacementPage> _Pages;
+StructuredBuffer<uint> _Counts;
+StructuredBuffer<PlacementLayer> _Layers;
+Texture2D<float> _Heightmap;
+Texture2D<float> _Holes;
+RWStructuredBuffer<SourceTransform> _Placements;
+float4 _TerrainSize;
+float4 _TerrainOrigin;
+int4 _PlacementLayout; // Heightmap resolution, hole resolution, detail width, texels on one patch side.
+int _PageBase;
+
+groupshared uint _Scan[256];
+
+// TerrainData.GetHeights returns raw / 32766. The UNorm texture returns raw / 65535.
+float HeightSample(int2 texel)
+{
+    return round(_Heightmap.Load(int3(texel, 0)) * 65535.0) / 32766.0;
+}
+
+float Height(float2 uv)
+{
+    int resolution = _PlacementLayout.x;
+    float2 samplePosition = saturate(uv) * (resolution - 1);
+    int2 lo = (int2)floor(samplePosition);
+    int2 hi = min(lo + 1, resolution - 1);
+    float2 t = frac(samplePosition);
+    return lerp(lerp(HeightSample(lo), HeightSample(int2(hi.x, lo.y)), t.x),
+        lerp(HeightSample(int2(lo.x, hi.y)), HeightSample(hi), t.x), t.y) * _TerrainSize.y;
+}
+
+float4 MultiplyQuaternion(float4 a, float4 b)
+{
+    return float4(a.w * b.xyz + b.w * a.xyz + cross(a.xyz, b.xyz), a.w * b.w - dot(a.xyz, b.xyz));
+}
+
+// Quaternion.Slerp(Quaternion.identity, rotation, amount) for a rotation with a non-negative w.
+float4 SlerpFromIdentity(float4 rotation, float amount)
+{
+    float angle = acos(saturate(rotation.w));
+    if (angle < 0.0001) return normalize(lerp(float4(0, 0, 0, 1), rotation, amount));
+    float scale = 1.0 / sin(angle);
+    return float4(0, 0, 0, sin((1 - amount) * angle) * scale) + rotation * (sin(amount * angle) * scale);
+}
+
+SourceTransform PlaceInstance(uint cell, uint ordinal, PlacementLayer layer)
+{
+    SourceTransform result = (SourceTransform)0;
+    uint detailWidth = (uint)_PlacementLayout.z;
+    uint seed = DetailHash(cell ^ layer.seed) ^ DetailHash(ordinal + 1);
+    float2 texel = float2(cell % detailWidth, cell / detailWidth);
+    // Placement fills the whole texel. A narrower spread leaves empty bands at texel edges, which show a grid.
+    float2 uv = (texel + float2(DetailRandom(seed), DetailRandom(seed + 1))) / detailWidth;
+    int holeResolution = _PlacementLayout.y;
+    int2 center = clamp((int2)(uv * holeResolution), 0, holeResolution - 1);
+    int2 padding = (int2)ceil(layer.holePadding * holeResolution / _TerrainSize.xz);
+    for (int z = max(0, center.y - padding.y); z <= min(holeResolution - 1, center.y + padding.y); z++)
+    {
+        for (int x = max(0, center.x - padding.x); x <= min(holeResolution - 1, center.x + padding.x); x++)
+        {
+            if (_Holes.Load(int3(x, z, 0)) < 0.5) return result;
+        }
+    }
+    float delta = 1.0 / (_PlacementLayout.x - 1);
+    float3 normal = normalize(float3(
+        (Height(uv - float2(delta, 0)) - Height(uv + float2(delta, 0))) / (2 * delta * _TerrainSize.x), 1,
+        (Height(uv - float2(0, delta)) - Height(uv + float2(0, delta))) / (2 * delta * _TerrainSize.z)));
+    float3 position = float3(uv.x * _TerrainSize.x, Height(uv), uv.y * _TerrainSize.z) + _TerrainOrigin.xyz;
+    float yaw = DetailRandom(seed + 2) * 6.283185307179586;
+    float width = lerp(layer.sizes.x, layer.sizes.y, DetailRandom(seed + 3));
+    float height = lerp(layer.sizes.z, layer.sizes.w, DetailRandom(seed + 4));
+    // Quaternion.FromToRotation(Vector3.up, normal). The normal always points up, so w stays positive.
+    float4 ground = normalize(float4(cross(float3(0, 1, 0), normal), 1 + normal.y));
+    float4 q = MultiplyQuaternion(SlerpFromIdentity(ground, layer.alignment),
+        float4(0, sin(yaw * 0.5), 0, cos(yaw * 0.5)));
+    float3 scale = float3(width, height, width);
+    float xx = q.x * q.x, yy = q.y * q.y, zz = q.z * q.z;
+    float xy = q.x * q.y, xz = q.x * q.z, yz = q.y * q.z;
+    float wx = q.w * q.x, wy = q.w * q.y, wz = q.w * q.z;
+    result.row0 = float4(float3(1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy)) * scale, position.x);
+    result.row1 = float4(float3(2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx)) * scale, position.y);
+    result.row2 = float4(float3(2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy)) * scale, position.z);
+    return result;
+}
+
+// One group places one page. Texels use row order and each texel places its instances in ordinal order.
+// This order equals the candidate order of the Reference backend.
+[numthreads(256, 1, 1)]
+void Place(uint3 group : SV_GroupID, uint lane : SV_GroupIndex)
+{
+    PlacementPage page = _Pages[_PageBase + group.x];
+    PlacementLayer layer = _Layers[page.texel.z];
+    uint side = (uint)_PlacementLayout.w;
+    uint texels = side * side;
+    uint written = 0;
+    for (uint first = 0; first < texels; first += 256)
+    {
+        uint texel = first + lane;
+        uint count = texel < texels ? _Counts[page.offsets.x + texel] : 0;
+        _Scan[lane] = count;
+        GroupMemoryBarrierWithGroupSync();
+        for (uint stride = 1; stride < 256; stride <<= 1)
+        {
+            uint previous = lane >= stride ? _Scan[lane - stride] : 0;
+            GroupMemoryBarrierWithGroupSync();
+            _Scan[lane] += previous;
+            GroupMemoryBarrierWithGroupSync();
+        }
+        uint start = written + _Scan[lane] - count;
+        uint total = _Scan[255];
+        GroupMemoryBarrierWithGroupSync();
+        if (texel < texels)
+        {
+            uint cell = (page.texel.y + texel / side) * (uint)_PlacementLayout.z + page.texel.x + texel % side;
+            for (uint ordinal = 0; ordinal < count && start + ordinal < page.offsets.z; ordinal++)
+            {
+                _Placements[page.offsets.y + start + ordinal] = PlaceInstance(cell, ordinal, layer);
+            }
+        }
+        written += total;
+    }
+}

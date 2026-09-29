@@ -1,0 +1,18 @@
+{
+  "name": "LoogaSoft.Terrain.Editor",
+  "rootNamespace": "LoogaSoft.Terrain.Editor",
+  "references": [
+    "LoogaSoft.Terrain.Runtime",
+    "LoogaSoft.Terrain.Instances",
+    "LoogaSoft.Instancing",
+    "LoogaSoft.Instancing.Universal",
+    "LoogaSoft.Inspector.Editor",
+    "Unity.RenderPipelines.Universal.Runtime",
+    "Unity.Mathematics",
+    "Unity.Splines"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "autoReferenced": true
+}

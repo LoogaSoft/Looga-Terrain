@@ -1,0 +1,19 @@
+{
+  "name": "LoogaSoft.Terrain.MicroSplat",
+  "rootNamespace": "LoogaSoft.Terrain.Integrations",
+  "references": [
+    "LoogaSoft.Terrain.Runtime",
+    "JBooth.MicroSplat.Core"
+  ],
+  "defineConstraints": [
+    "LOOGA_TERRAIN_MICROSPLAT"
+  ],
+  "versionDefines": [
+    {
+      "name": "com.jbooth.microsplat.core",
+      "expression": "3.9.0",
+      "define": "LOOGA_TERRAIN_MICROSPLAT"
+    }
+  ],
+  "autoReferenced": true
+}

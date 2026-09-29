@@ -1,0 +1,10 @@
+#pragma kernel SampleHeights
+#include "../../Runtime/Shaders/TerrainGeometry.hlsl"
+RWStructuredBuffer<float> _Samples;
+[numthreads(8, 8, 1)]
+void SampleHeights(uint3 id : SV_DispatchThreadID)
+{
+    uint resolution = (uint)_LoogaHeightInfo.x;
+    if (id.x >= resolution || id.y >= resolution) return;
+    _Samples[id.y * resolution + id.x] = LoogaPosition((float2)id.xy / (resolution - 1)).y;
+}

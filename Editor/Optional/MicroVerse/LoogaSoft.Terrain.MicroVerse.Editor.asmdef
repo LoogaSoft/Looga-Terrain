@@ -1,0 +1,24 @@
+{
+  "name": "LoogaSoft.Terrain.MicroVerse.Editor",
+  "references": [
+    "LoogaSoft.Terrain.MicroVerse",
+    "LoogaSoft.Terrain.Editor",
+    "LoogaSoft.Terrain.Runtime",
+    "LoogaSoft.Terrain.Instances",
+    "LoogaSoft.Instancing",
+    "JBooth.MicroVerseCore"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "defineConstraints": [
+    "LOOGA_TERRAIN_MICROVERSE"
+  ],
+  "versionDefines": [
+    {
+      "name": "com.jbooth.microverse",
+      "expression": "1.7.0",
+      "define": "LOOGA_TERRAIN_MICROVERSE"
+    }
+  ]
+}

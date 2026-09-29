@@ -1,0 +1,10 @@
+{
+  "name": "LoogaSoft.Terrain.Benchmarks",
+  "rootNamespace": "LoogaSoft.Terrain.Benchmarks",
+  "references": [
+    "LoogaSoft.Terrain.Runtime",
+    "Unity.RenderPipelines.Core.Runtime",
+    "Unity.RenderPipelines.Universal.Runtime"
+  ],
+  "autoReferenced": true
+}

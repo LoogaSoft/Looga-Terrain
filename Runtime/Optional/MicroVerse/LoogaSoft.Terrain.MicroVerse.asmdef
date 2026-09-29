@@ -1,0 +1,26 @@
+{
+  "name": "LoogaSoft.Terrain.MicroVerse",
+  "rootNamespace": "LoogaSoft.Terrain.Integrations",
+  "references": [
+    "LoogaSoft.Terrain.Runtime",
+    "JBooth.MicroVerseCore",
+    "LoogaSoft.Terrain.Instances",
+    "LoogaSoft.Instancing"
+  ],
+  "defineConstraints": [
+    "LOOGA_TERRAIN_MICROVERSE"
+  ],
+  "versionDefines": [
+    {
+      "name": "com.jbooth.microverse",
+      "expression": "1.7.0",
+      "define": "LOOGA_TERRAIN_MICROVERSE"
+    },
+    {
+      "name": "com.jbooth.microverse.objects",
+      "expression": "1.7.0",
+      "define": "LOOGA_TERRAIN_MICROVERSE_OBJECTS"
+    }
+  ],
+  "autoReferenced": true
+}

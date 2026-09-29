@@ -1,0 +1,104 @@
+#pragma kernel EncodeBC3
+Texture2D<float4> _Source;
+RWTexture2D<uint4> _Blocks;
+int _NormalChannel;
+
+uint Pack565(float3 color)
+{
+    uint3 value = (uint3)round(saturate(color) * float3(31, 63, 31));
+    return (value.x << 11) | (value.y << 5) | value.z;
+}
+
+float3 Unpack565(uint value)
+{
+    return float3((value >> 11) & 31, (value >> 5) & 63, value & 31) / float3(31, 63, 31);
+}
+
+[numthreads(8, 8, 1)]
+void EncodeBC3(uint3 dispatch : SV_DispatchThreadID)
+{
+    if (any(dispatch.xy >= 34)) return;
+    float4 colors[16];
+    float3 low = 1, high = 0;
+    float alphaLow = 1, alphaHigh = 0;
+    for (uint i = 0; i < 16; i++)
+    {
+        float4 value = _Source.Load(int3(dispatch.xy * 4 + uint2(i & 3, i >> 2), 0));
+        if (_NormalChannel != 0)
+        {
+            // MicroSplat can produce unnormalized normals. Preserve direction before mapping to UNorm.
+            value.rgb *= rsqrt(max(dot(value.rgb, value.rgb), 1e-12));
+            value.rgb = value.rgb * 0.5 + 0.5;
+        }
+        else
+        {
+            // The source SRGB view returns linear color. BC3 stores SRGB-encoded bytes.
+            value.rgb = lerp(12.92 * value.rgb, 1.055 * pow(max(value.rgb, 0), 1.0 / 2.4) - 0.055, step(0.0031308, value.rgb));
+        }
+        colors[i] = saturate(value);
+        low = min(low, colors[i].rgb);
+        high = max(high, colors[i].rgb);
+        alphaLow = min(alphaLow, colors[i].a);
+        alphaHigh = max(alphaHigh, colors[i].a);
+    }
+    // The farthest color pair also handles opposing channel changes, such as red beside green.
+    float maximum = -1;
+    float3 endpointLow = low, endpointHigh = high;
+    for (uint j = 1; j < 16; j++)
+    {
+        for (uint k = 0; k < j; k++)
+        {
+            float3 difference = colors[j].rgb - colors[k].rgb;
+            float distance = dot(difference, difference);
+            if (distance > maximum)
+            {
+                maximum = distance;
+                endpointLow = colors[k].rgb;
+                endpointHigh = colors[j].rgb;
+            }
+        }
+    }
+    uint c0 = Pack565(endpointHigh), c1 = Pack565(endpointLow);
+    uint first = max(c0, c1), second = min(c0, c1);
+    float3 palette[4];
+    palette[0] = Unpack565(first);
+    palette[1] = Unpack565(second);
+    palette[2] = (2 * palette[0] + palette[1]) / 3;
+    palette[3] = (palette[0] + 2 * palette[1]) / 3;
+    uint alpha0 = (uint)round(alphaHigh * 255), alpha1 = (uint)round(alphaLow * 255);
+    uint2 alpha = uint2(alpha0 | (alpha1 << 8), 0);
+    uint indices = 0;
+    for (uint pixel = 0; pixel < 16; pixel++)
+    {
+        float error = 1e10;
+        uint best = 0;
+        for (uint color = 0; color < 4; color++)
+        {
+            float3 difference = colors[pixel].rgb - palette[color];
+            float distance = dot(difference, difference);
+            if (distance < error) { error = distance; best = color; }
+        }
+        indices |= best << (pixel * 2);
+        error = 1e10;
+        best = 0;
+        for (uint entry = 0; entry < 8; entry++)
+        {
+            float a = entry == 0 ? alpha0 : entry == 1 ? alpha1
+                : alpha0 > alpha1 ? ((8 - entry) * alpha0 + (entry - 1) * alpha1) / 7.0
+                : entry == 6 ? 0 : entry == 7 ? 255 : ((6 - entry) * alpha0 + (entry - 1) * alpha1) / 5.0;
+            float distance = abs(colors[pixel].a * 255 - a);
+            if (distance < error) { error = distance; best = entry; }
+        }
+        uint bit = 16 + pixel * 3;
+        if (bit < 32)
+        {
+            alpha.x |= best << bit;
+            if (bit > 29) alpha.y |= best >> (32 - bit);
+        }
+        else
+        {
+            alpha.y |= best << (bit - 32);
+        }
+    }
+    _Blocks[dispatch.xy] = uint4(alpha, first | (second << 16), indices);
+}

@@ -1,0 +1,27 @@
+{
+  "name": "LoogaSoft.Terrain.EditorTests",
+  "rootNamespace": "LoogaSoft.Terrain.Tests",
+  "references": [
+    "LoogaSoft.Terrain.Runtime",
+    "LoogaSoft.Terrain.Editor",
+    "Unity.RenderPipelines.Universal.Runtime",
+    "Unity.Collections",
+    "LoogaSoft.Terrain.Instances",
+    "LoogaSoft.Terrain.GroundCache",
+    "LoogaSoft.Instancing",
+    "LoogaSoft.Instancing.Universal",
+    "LoogaSoft.Instancing.Editor",
+    "Unity.Mathematics",
+    "Unity.Splines"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "optionalUnityReferences": [
+    "TestAssemblies"
+  ],
+  "autoReferenced": false,
+  "defineConstraints": [
+    "UNITY_INCLUDE_TESTS"
+  ]
+}

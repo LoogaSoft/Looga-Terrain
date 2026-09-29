@@ -1,0 +1,10 @@
+{
+  "name": "LoogaSoft.Terrain.GroundCache",
+  "rootNamespace": "LoogaSoft.Terrain",
+  "references": [
+    "LoogaSoft.Terrain.Runtime",
+    "LoogaSoft.Terrain.Instances",
+    "LoogaSoft.Instancing"
+  ],
+  "autoReferenced": true
+}

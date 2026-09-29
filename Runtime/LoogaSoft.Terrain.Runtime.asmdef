@@ -1,0 +1,14 @@
+{
+  "name": "LoogaSoft.Terrain.Runtime",
+  "rootNamespace": "LoogaSoft.Terrain",
+  "references": [
+    "LoogaSoft.Instancing",
+    "LoogaSoft.Terrain.Instances",
+    "Unity.RenderPipelines.Universal.Runtime",
+    "Unity.Burst",
+    "Unity.Collections",
+    "Unity.Mathematics",
+    "Unity.Splines"
+  ],
+  "autoReferenced": true
+}

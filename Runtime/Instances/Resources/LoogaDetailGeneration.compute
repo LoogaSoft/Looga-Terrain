@@ -1,0 +1,51 @@
+#pragma kernel Generate
+#pragma target 5.0
+#include "../Shaders/DetailPlacement.hlsl"
+
+struct Placement { float4 position; float4 scale; float4 normal; };
+StructuredBuffer<uint2> _Candidates;
+StructuredBuffer<float> _Heights;
+StructuredBuffer<uint> _Holes;
+RWStructuredBuffer<Placement> _Output;
+int4 _Layout;
+uint _Seed;
+float3 _Size;
+float4 _Sizes;
+float _HolePadding;
+
+float Height(float2 uv)
+{
+    float2 samplePosition = saturate(uv) * (_Layout.x - 1);
+    int2 lo = (int2)floor(samplePosition);
+    int2 hi = min(lo + 1, _Layout.x - 1);
+    float2 t = frac(samplePosition);
+    return lerp(lerp(_Heights[lo.y * _Layout.x + lo.x], _Heights[lo.y * _Layout.x + hi.x], t.x),
+        lerp(_Heights[hi.y * _Layout.x + lo.x], _Heights[hi.y * _Layout.x + hi.x], t.x), t.y) * _Size.y;
+}
+[numthreads(64, 1, 1)]
+void Generate(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_Layout.w) return;
+    uint2 candidate = _Candidates[id.x];
+    uint seed = DetailHash(candidate.x ^ _Seed) ^ DetailHash(candidate.y + 1);
+    float2 cell = float2(candidate.x % (uint)_Layout.z, candidate.x / (uint)_Layout.z);
+    float2 uv = (cell + float2(DetailRandom(seed), DetailRandom(seed + 1))) / _Layout.z;
+    float2 delta = 1.0 / (_Layout.x - 1);
+    float3 normal = normalize(float3((Height(uv - float2(delta.x, 0)) - Height(uv + float2(delta.x, 0))) / (2 * delta.x * _Size.x),
+        1, (Height(uv - float2(0, delta.y)) - Height(uv + float2(0, delta.y))) / (2 * delta.y * _Size.z)));
+    bool valid = true;
+    int2 center = clamp((int2)(uv * _Layout.y), 0, _Layout.y - 1);
+    int2 padding = (int2)ceil(_HolePadding * _Layout.y / _Size.xz);
+    for (int z = max(0, center.y - padding.y); z <= min(_Layout.y - 1, center.y + padding.y); z++)
+    {
+        for (int x = max(0, center.x - padding.x); x <= min(_Layout.y - 1, center.x + padding.x); x++)
+        {
+            valid = valid && _Holes[z * _Layout.y + x] != 0;
+        }
+    }
+    Placement result;
+    result.position = float4(uv.x * _Size.x, Height(uv), uv.y * _Size.z, DetailRandom(seed + 2) * 6.283185307179586);
+    result.scale = float4(lerp(_Sizes.x, _Sizes.y, DetailRandom(seed + 3)), lerp(_Sizes.z, _Sizes.w, DetailRandom(seed + 4)), 0, valid ? 1 : 0);
+    result.normal = float4(normal, 0);
+    _Output[id.x] = result;
+}
