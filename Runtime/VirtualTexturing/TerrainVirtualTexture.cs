@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using LoogaSoft.Instancing;
 using UnityEngine;
 
 namespace LoogaSoft.Terrain
@@ -23,7 +24,31 @@ namespace LoogaSoft.Terrain
         private static GraphicsBuffer _fallbackTable;
         private static Texture2DArray _fallbackTexture;
         internal VirtualSurfaceCache.Tile Tile { get; private set; }
-        private static readonly Dictionary<(VirtualTextureSettings, int), VirtualSurfaceCache> _caches = new();
+        private static readonly Dictionary<(VirtualTextureSettings, int, int), VirtualSurfaceCache> _caches = new();
+        // Pixels and last render time of each camera that renders cached terrain. The pool is sized for the largest.
+        private static readonly Dictionary<Camera, (long Pixels, float Time)> _cameraPixels = new();
+        private static readonly List<Camera> _expiredCameras = new();
+        private static long _poolPixels;
+        private static float _shrinkSince = -1f;
+        // A camera that has not rendered for this time no longer sizes the pool. A smaller pool waits for the shrink
+        // delay, so a window resize or a closed view does not rebuild the cache at once.
+        private const float CameraTimeout = 2f;
+        private const float ShrinkDelay = 10f;
+
+        /// <summary>
+        /// Shades cached surfaces directly while the cache stays resident, for example for comparisons. Surfaces that
+        /// check the switch read _LoogaVTShadeDirectly.
+        /// </summary>
+        public static bool ShadeDirectly
+        {
+            get => Shader.GetGlobalFloat(ShadeDirectlyId) > 0.5f;
+            set => Shader.SetGlobalFloat(ShadeDirectlyId, value ? 1f : 0f);
+        }
+        private static readonly int ShadeDirectlyId = Shader.PropertyToID("_LoogaVTShadeDirectly");
+        private static readonly int ResidencyBiasId = Shader.PropertyToID("_LoogaVTResidencyBias");
+
+        /// <summary>Gets the camera pixels that size the shared pools. 0 = no camera yet (reference size).</summary>
+        public static long PoolPixels => _poolPixels;
 
         /// <summary>Gets the most recent configuration failure.</summary>
         public string Diagnostic { get; private set; } = string.Empty;
@@ -78,6 +103,20 @@ namespace LoogaSoft.Terrain
             }
         }
 
+        /// <summary>
+        /// Invalidates the cached pages of all tiles inside a world XZ area, after a change of world data that the page
+        /// producers read, such as the ground cover or world colour maps. Null invalidates all pages.
+        /// </summary>
+        public static void InvalidateWorldArea(Rect? worldArea)
+        {
+            if (_caches.Count == 0) return;
+            GroundCacheInvalidated?.Invoke();
+            foreach (VirtualSurfaceCache cache in _caches.Values)
+            {
+                cache.InvalidateWorld(worldArea);
+            }
+        }
+
         /// <summary>Invalidates cached pages inside normalized terrain coordinates.</summary>
         public void Invalidate(Rect normalizedRegion)
         {
@@ -89,13 +128,25 @@ namespace LoogaSoft.Terrain
         }
 
         #region Cache binding
+        // The assigned producer, or the drawn surface when it has its own page pass. A surface that a component supplies
+        // at run time, such as a Looga terrain surface binding, cannot be assigned as an asset.
+        private Material PageProducer
+        {
+            get
+            {
+                if (_pageProducer) return _pageProducer;
+                Material surface = _renderer ? _renderer.ActiveSurfaceMaterial : null;
+                return surface && surface.FindPass("LoogaVTBake") >= 0 ? surface : null;
+            }
+        }
+
         private void Register()
         {
-            if (_renderer && _registeredSurface != _renderer.SurfaceMaterial)
+            if (_renderer && _registeredSurface != _renderer.ActiveSurfaceMaterial)
             {
                 Unregister();
                 _registrationFailed = false;
-                _registeredSurface = _renderer.SurfaceMaterial;
+                _registeredSurface = _renderer.ActiveSurfaceMaterial;
             }
             if (_configurationDirty)
             {
@@ -103,30 +154,32 @@ namespace LoogaSoft.Terrain
                 _registrationFailed = false;
                 _configurationDirty = false;
             }
-            if (_cache != null && (!_settings || _cache.SettingsRevision != _settings.Revision))
+            int capacity = _settings ? _settings.PagesForPixels(_poolPixels) : 0;
+            if (_cache != null && (!_settings || _cache.SettingsRevision != _settings.Revision || _cache.Capacity != capacity))
             {
                 Unregister();
             }
-            if (_registrationFailed || _cache != null || !_renderer || !_renderer.IsReady || !_settings || !_pageProducer) return;
+            Material producer = PageProducer;
+            if (_registrationFailed || _cache != null || !_renderer || !_renderer.IsReady || !_settings || !producer) return;
             VirtualSurfaceCache cache = null;
             try
             {
-                if (!_renderer.SupportsVirtualTexturing || _pageProducer.FindPass("LoogaVTBake") < 0)
+                if (!_renderer.SupportsVirtualTexturing || producer.FindPass("LoogaVTBake") < 0)
                 {
                     throw new InvalidOperationException("Assign a virtual-texture surface and its matching page producer.");
                 }
-                string schema = _renderer.SurfaceMaterial.GetTag(SchemaTag, false, "");
-                string producerSchema = _pageProducer.GetTag(SchemaTag, false, "");
+                string schema = InstanceShaderInspection.GetTag(_renderer.ActiveSurfaceMaterial, SchemaTag);
+                string producerSchema = InstanceShaderInspection.GetTag(producer, SchemaTag);
                 if (schema != producerSchema)
                 {
                     throw new InvalidOperationException("The surface and page producer schemas differ. Re-export and assign the matching pair.");
                 }
-                if (!_caches.TryGetValue((_settings, _settings.Revision), out cache))
+                if (!_caches.TryGetValue((_settings, _settings.Revision, capacity), out cache))
                 {
-                    cache = new VirtualSurfaceCache(_settings);
-                    _caches.Add((_settings, _settings.Revision), cache);
+                    cache = new VirtualSurfaceCache(_settings, capacity);
+                    _caches.Add((_settings, _settings.Revision, capacity), cache);
                 }
-                Tile = cache.Add(_renderer, _pageProducer);
+                Tile = cache.Add(_renderer, producer);
                 _cache = cache;
                 Diagnostic = string.Empty;
             }
@@ -134,7 +187,7 @@ namespace LoogaSoft.Terrain
             {
                 if (cache != null && cache.TileCount == 0)
                 {
-                    _caches.Remove((_settings, _settings.Revision));
+                    _caches.Remove((_settings, _settings.Revision, capacity));
                     cache.Dispose();
                 }
                 _registrationFailed = true;
@@ -150,7 +203,7 @@ namespace LoogaSoft.Terrain
             _cache.Remove(Tile);
             if (_cache.TileCount == 0)
             {
-                _caches.Remove((_cache.Settings, _cache.SettingsRevision));
+                _caches.Remove((_cache.Settings, _cache.SettingsRevision, _cache.Capacity));
                 _cache.Dispose();
             }
             _cache = null;
@@ -177,7 +230,7 @@ namespace LoogaSoft.Terrain
             return true;
         }
         /// <summary>True when the producer stores world normals. Older MicroSplat producers store terrain tangent normals.</summary>
-        public bool GroundNormalsAreWorldSpace => _pageProducer && _pageProducer.GetTag("LoogaVTNormalSpace", false, "TerrainTangent") == "World";
+        public bool GroundNormalsAreWorldSpace => InstanceShaderInspection.GetTag(PageProducer, "LoogaVTNormalSpace") == "World";
 
         /// <summary>Copy existing page addresses into a receiver lookup buffer. Physical surface pages remain shared.</summary>
         public void CopyGroundPageTable(uint[] destination, int offset)
@@ -245,6 +298,7 @@ namespace LoogaSoft.Terrain
 
         internal static void BeginCamera(Camera camera, List<TerrainRenderer> renderers)
         {
+            UpdatePoolPixels(camera);
             foreach (TerrainRenderer renderer in renderers)
             {
                 if (renderer.VirtualTexture)
@@ -252,11 +306,68 @@ namespace LoogaSoft.Terrain
                     renderer.VirtualTexture.Register();
                 }
             }
+            float residencyBias = 0f;
             foreach (VirtualSurfaceCache cache in _caches.Values)
             {
                 cache.BeginCamera(camera, renderers);
+                residencyBias = Mathf.Max(residencyBias, cache.ResidencyBias);
             }
+            // One global bias for all caches, as the feedback shader is shared. The largest bias of a cache applies.
+            Shader.SetGlobalFloat(ResidencyBiasId, residencyBias);
             GroundCachesUpdated?.Invoke();
+        }
+
+        // The pool follows the largest game camera, or the largest Scene view when no game camera renders. Preview and
+        // reflection cameras do not size it.
+        private static void UpdatePoolPixels(Camera camera)
+        {
+            float now = Time.realtimeSinceStartup;
+            if (camera.cameraType == CameraType.Game || camera.cameraType == CameraType.SceneView)
+            {
+                _cameraPixels[camera] = ((long)camera.pixelWidth * camera.pixelHeight, now);
+            }
+            long game = 0;
+            long any = 0;
+            _expiredCameras.Clear();
+            foreach (var entry in _cameraPixels)
+            {
+                if (!entry.Key || now - entry.Value.Time > CameraTimeout)
+                {
+                    _expiredCameras.Add(entry.Key);
+                    continue;
+                }
+                any = Math.Max(any, entry.Value.Pixels);
+                if (entry.Key.cameraType == CameraType.Game)
+                {
+                    game = Math.Max(game, entry.Value.Pixels);
+                }
+            }
+            foreach (Camera old in _expiredCameras)
+            {
+                _cameraPixels.Remove(old);
+            }
+            long target = game > 0 ? game : any;
+            if (target > _poolPixels)
+            {
+                _poolPixels = target;
+                _shrinkSince = -1f;
+            }
+            else if (target < _poolPixels * 3 / 4)
+            {
+                if (_shrinkSince < 0f)
+                {
+                    _shrinkSince = now;
+                }
+                else if (now - _shrinkSince > ShrinkDelay)
+                {
+                    _poolPixels = target;
+                    _shrinkSince = -1f;
+                }
+            }
+            else
+            {
+                _shrinkSince = -1f;
+            }
         }
 
         internal static void EndCamera(Camera camera, List<TerrainRenderer> renderers)
@@ -290,5 +401,7 @@ namespace LoogaSoft.Terrain
         public int LastFrameFills;
         public long LocalInvalidations;
         public long InvalidatedPages;
+        /// <summary>Gets the mip bias that the residency control applies to all reads of this cache.</summary>
+        public float ResidencyMipBias;
     }
 }

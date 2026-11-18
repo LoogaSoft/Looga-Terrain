@@ -8,7 +8,7 @@
     "Unity.Collections",
     "LoogaSoft.Terrain.Instances",
     "LoogaSoft.Terrain.GroundCache",
-    "LoogaSoft.Instancing",
+    "LoogaSoft.Instancing.Runtime",
     "LoogaSoft.Instancing.Universal",
     "LoogaSoft.Instancing.Editor",
     "Unity.Mathematics",

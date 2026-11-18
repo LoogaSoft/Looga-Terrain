@@ -3,6 +3,7 @@
   "rootNamespace": "LoogaSoft.Terrain.Integrations",
   "references": [
     "LoogaSoft.Terrain.Runtime",
+    "LoogaSoft.Instancing.Runtime",
     "JBooth.MicroSplat.Core"
   ],
   "defineConstraints": [

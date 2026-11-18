@@ -262,9 +262,19 @@ namespace LoogaSoft.Terrain.Instances
         }
         internal static float Random(uint value) => (Hash(value) & 0x00ffffffu) * (1f / 16777216f);
 
+        // Keep this equal to DetailPosition in DetailPlacement.hlsl.
+        internal static float2 Position(float2 texel, uint seed, float detailWidth)
+        {
+            float2 offset = new float2(Random(seed) + Random(seed + 5), Random(seed + 1) + Random(seed + 6));
+            float2 uv = (texel + offset - 0.5f) / detailWidth;
+            return 1f - math.abs(1f - math.abs(uv));
+        }
+
         /// <summary>Expected instances for each unit of painted density in one detail texel.</summary>
         internal static float DensityMultiplier(UnityEngine.Terrain terrain, int layer)
         {
+            // Another renderer draws a replaced layer, so the layer places nothing here.
+            if (ReplacedDetailLayers.IsReplaced(terrain, layer)) return 0;
             TerrainData data = terrain.terrainData;
             float multiplier = data.detailPrototypes[layer].useDensityScaling ? terrain.detailObjectDensity : 1;
             if (data.detailScatterMode == DetailScatterMode.CoverageMode)
@@ -309,8 +319,7 @@ namespace LoogaSoft.Terrain.Instances
                 Candidate candidate = Input[index];
                 uint seed = Hash(candidate.Cell ^ Seed) ^ Hash(candidate.Ordinal + 1);
                 float2 cell = new float2(candidate.Cell % (uint)DetailWidth, candidate.Cell / (uint)DetailWidth);
-                // Placement fills the whole texel. A narrower spread leaves empty bands at texel edges, which show a grid.
-                float2 uv = (cell + new float2(Random(seed), Random(seed + 1))) / DetailWidth;
+                float2 uv = Position(cell, seed, DetailWidth);
                 float2 delta = new float2(1f / (Resolution - 1));
                 float3 normal = math.normalize(new float3((Height(uv - new float2(delta.x, 0)) - Height(uv + new float2(delta.x, 0))) / (2 * delta.x * Size.x),
                     1, (Height(uv - new float2(0, delta.y)) - Height(uv + new float2(0, delta.y))) / (2 * delta.y * Size.z)));

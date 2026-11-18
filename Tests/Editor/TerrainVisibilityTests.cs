@@ -95,7 +95,7 @@ namespace LoogaSoft.Terrain.Tests
                 target.Create();
                 camera.targetTexture = target;
                 var occlusion = cameraObject.AddComponent<TerrainOcclusionCamera>();
-                occlusion.Configure(AssetDatabase.LoadAssetAtPath<Shader>(Package + "Shaders/TerrainOcclusionDepth.shader"), batch ? AssetDatabase.LoadAssetAtPath<Shader>(Package + "Shaders/TerrainBatchedShadows.shader") : null, true, depth);
+                occlusion.Configure(AssetDatabase.LoadAssetAtPath<Shader>(Package + "Shaders/TerrainOcclusionDepth.shader"), depth);
                 for (int view = 0; view < 5; view++)
                 {
                     if (view == 4)

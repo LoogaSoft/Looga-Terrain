@@ -26,6 +26,11 @@ namespace LoogaSoft.Terrain.Instances
             internal bool Reading;
             internal float Distance;
             internal bool Required;
+            // World height range of a detail patch. An eviction clears it, so a patch that a height change evicted
+            // measures it again.
+            internal bool HasHeights;
+            internal float MinY;
+            internal float MaxY;
         }
 
 
@@ -49,6 +54,10 @@ namespace LoogaSoft.Terrain.Instances
         private readonly UnityEngine.Terrain _terrain;
         private readonly IVegetationPageSource _pageSource;
         private bool _trimPending;
+        // True after a GPU cell did not fit the GPU reservation. No GPU cell loads until an eviction frees space or
+        // the budget changes, so the same cell does not load and unload in each update.
+        private bool _gpuReservationFull;
+        private long _gpuReservationFullBudget;
         private int _pageRequests;
         private int _pendingReads;
         private readonly TerrainData _data;
@@ -59,6 +68,8 @@ namespace LoogaSoft.Terrain.Instances
         private readonly DetailPrototypeResources _detailResources = new();
         private readonly List<Cell> _cells = new();
         private readonly List<Cell> _pending = new();
+        // A cached comparer. Sorting with a method group allocates a delegate and a comparer on each call.
+        private static readonly IComparer<Cell> CellOrder = Comparer<Cell>.Create(CompareCells);
         private readonly Dictionary<Vector2Int, Cell> _patches = new();
         private readonly int _instanceLimit;
         private readonly InstanceRenderer _treeRenderer;
@@ -111,9 +122,17 @@ namespace LoogaSoft.Terrain.Instances
         internal int DecompressedBytes { get; private set; }
         internal int RequiredCells { get; private set; }
         internal int MissingRequiredCells { get; private set; }
+        /// <summary>
+        /// True when the last update left a required cell missing because of the instance limit, the cell limit or the
+        /// GPU reservation.
+        /// </summary>
+        internal bool BudgetLimited { get; private set; }
         internal double UpdatedAt { get; private set; } = double.NegativeInfinity;
         internal Vector3 ObserverPosition { get; private set; }
         internal long GpuBytes => (_treeRenderer?.GpuBytes ?? 0) + (_detailRenderer?.GpuBytes ?? 0);
+        /// <summary>The GPU bytes that the budget check uses: source storage and eight view buffers.</summary>
+        internal long ProjectedGpuBytes =>
+            (_treeRenderer?.ProjectedGpuBytes() ?? 0) + (_detailRenderer?.ProjectedGpuBytes() ?? 0);
 
         internal long TotalUploadedBytes => (_treeRenderer?.UploadedBytes ?? 0) + (_detailRenderer?.UploadedBytes ?? 0);
 
@@ -301,6 +320,44 @@ namespace LoogaSoft.Terrain.Instances
             }
         }
 
+        /// <summary>
+        /// Reads the trees of the tree cells in terrain-local XZ areas again and loads those cells again. A height
+        /// change moves the trees on the ground, and the cells keep a copy of their trees.
+        /// </summary>
+        internal void RefreshTrees(IReadOnlyList<Rect> areas)
+        {
+            var changed = new HashSet<Cell>();
+            foreach (Rect area in areas)
+            {
+                for (int z = Mathf.FloorToInt(area.yMin / 64); z <= Mathf.FloorToInt(area.yMax / 64); z++)
+                {
+                    for (int x = Mathf.FloorToInt(area.xMin / 64); x <= Mathf.FloorToInt(area.xMax / 64); x++)
+                    {
+                        if (_treeCells.TryGetValue(new Vector2Int(x, z), out Cell cell))
+                        {
+                            changed.Add(cell);
+                        }
+                    }
+                }
+            }
+            if (changed.Count == 0) return;
+
+            foreach (Cell cell in changed)
+            {
+                Evict(cell);
+                cell.Trees.Clear();
+            }
+            foreach (TreeInstance tree in _data.treeInstances)
+            {
+                Vector3 local = Vector3.Scale(tree.position, _data.size);
+                var key = new Vector2Int(Mathf.FloorToInt(local.x / 64), Mathf.FloorToInt(local.z / 64));
+                if (_treeCells.TryGetValue(key, out Cell cell) && changed.Contains(cell))
+                {
+                    cell.Trees.Add(tree);
+                }
+            }
+        }
+
         internal bool Update(Transform[] observers, float margin, int workBudget, float shadowDistance, int minimumShadowLod, VegetationStreamingBudget budget)
         {
             budget = budget.Normalized();
@@ -315,6 +372,11 @@ namespace LoogaSoft.Terrain.Instances
             Evictions = 0;
             DiskReadBytes = 0;
             DecompressedBytes = 0;
+            BudgetLimited = false;
+            if (_gpuReservationFull && budget.ResidentGpuBytes != _gpuReservationFullBudget)
+            {
+                _gpuReservationFull = false;
+            }
             int observersFound = 0;
             foreach (Transform observer in observers)
             {
@@ -342,10 +404,10 @@ namespace LoogaSoft.Terrain.Instances
                     {
                         continue;
                     }
-                    var camera = observer.GetComponent<Camera>();
-                    if (!camera)
+                    // TryGetComponent makes no editor null-object garbage when the component is missing.
+                    if (!observer.TryGetComponent(out Camera camera))
                     {
-                        if (observer.GetComponent<VegetationInterest>())
+                        if (observer.TryGetComponent(out VegetationInterest _))
                         {
                             continue;
                         }
@@ -366,7 +428,7 @@ namespace LoogaSoft.Terrain.Instances
                 {
                     continue;
                 }
-                VegetationInterest interest = observer.GetComponent<VegetationInterest>();
+                observer.TryGetComponent(out VegetationInterest interest);
                 bool active = interest && interest.isActiveAndEnabled;
                 float radius = active ? interest.Radius : -1f;
                 bool predict = active && budget.PrefetchSeconds > 0f;
@@ -404,6 +466,9 @@ namespace LoogaSoft.Terrain.Instances
             {
                 if (!_interested.Contains(cell))
                 {
+                    // The residency change limit can keep this cell for later updates. It is not required now, so
+                    // EvictPrefetch can release it when a required cell needs the space.
+                    cell.Required = false;
                     _evict.Add(cell);
                 }
             }
@@ -416,15 +481,22 @@ namespace LoogaSoft.Terrain.Instances
             {
                 float distance = float.PositiveInfinity;
                 float range = cell.Trees != null ? treeRange + _treePadding : detailRange + _detailPadding;
+                if (cell.Trees == null)
+                {
+                    EnsureHeights(cell);
+                }
                 foreach (ObserverState observer in _observerStates)
                 {
                     Vector3 delta = observer.Position - cell.Bounds.center;
                     float x = Mathf.Max(0, Mathf.Abs(delta.x) - cell.Bounds.extents.x);
                     float z = Mathf.Max(0, Mathf.Abs(delta.z) - cell.Bounds.extents.z);
+                    // Details are culled by 3D camera distance. An observer high above a patch does not need it.
+                    float y = cell.HasHeights ?
+                        Mathf.Max(0, Mathf.Max(cell.MinY - observer.Position.y, observer.Position.y - cell.MaxY)) : 0;
                     float observerRange = observer.InterestRadius >= 0f ?
                         RequiredObserverRadius(observer.InterestRadius +
                             (cell.Trees != null ? _treePadding : _detailPadding), range) : range;
-                    distance = Mathf.Min(distance, Mathf.Sqrt(x * x + z * z) - observerRange + range);
+                    distance = Mathf.Min(distance, Mathf.Sqrt(x * x + y * y + z * z) - observerRange + range);
                 }
                 cell.Distance = distance;
                 cell.Required = distance <= range;
@@ -437,7 +509,7 @@ namespace LoogaSoft.Terrain.Instances
                     _pending.Add(cell);
                 }
             }
-            _pending.Sort(CompareCells);
+            _pending.Sort(CellOrder);
             _treeRenderer.RenderingEnabled = _detailRenderer.RenderingEnabled = false;
             foreach (Cell cell in _pending)
             {
@@ -459,16 +531,22 @@ namespace LoogaSoft.Terrain.Instances
                     EvictPrefetch();
                     if (_active.Count >= _cellLimit)
                     {
-                        throw new InvalidOperationException("Required vegetation cells exceed the resident cell budget.");
+                        // Over a budget, the missing cells stay empty. Loaded cells keep drawing.
+                        BudgetLimited = true;
+                        break;
                     }
                 }
-                _active.Add(cell);
                 if (gpuCell)
                 {
-                    StageGpu(cell);
+                    if (_gpuReservationFull || !StageGpu(cell, budget))
+                    {
+                        BudgetLimited |= cell.Required;
+                        break;
+                    }
                 }
                 else
                 {
+                    _active.Add(cell);
                     Stage(cell, budget);
                 }
             }
@@ -480,14 +558,19 @@ namespace LoogaSoft.Terrain.Instances
                 _detailRenderer.TrimExcess();
                 _trimPending = false;
             }
-            if (_treeRenderer.ProjectedGpuBytes() + _detailRenderer.ProjectedGpuBytes() > budget.ResidentGpuBytes)
+            if (ProjectedGpuBytes > budget.ResidentGpuBytes)
             {
                 EvictPrefetch();
                 _treeRenderer.TrimExcess();
                 _detailRenderer.TrimExcess();
-                if (_treeRenderer.ProjectedGpuBytes() + _detailRenderer.ProjectedGpuBytes() > budget.ResidentGpuBytes)
+                if (ProjectedGpuBytes > budget.ResidentGpuBytes)
                 {
-                    throw new InvalidOperationException("Required vegetation exceeds the GPU reservation, including eight view buffers.");
+                    // The storage keeps its capacity until the trim finds it four times too large, so evictions here
+                    // free no reservation. The loaded cells keep drawing, and no GPU cell loads until an eviction
+                    // frees space. The allocated bytes below are the hard limit.
+                    BudgetLimited = true;
+                    _gpuReservationFull = true;
+                    _gpuReservationFullBudget = budget.ResidentGpuBytes;
                 }
             }
             long before = _treeRenderer.UploadedBytes;
@@ -521,7 +604,9 @@ namespace LoogaSoft.Terrain.Instances
             UpdatedAt = Time.realtimeSinceStartupAsDouble;
             // After the first complete update, GPU-resident details draw loaded cells while new cells load.
             // A return to native rendering would make Unity rebuild native details on the CPU.
-            _hasRendered |= IsReady;
+            // A budget-limited stream cannot become ready. Its GPU-resident details draw the loaded cells, because
+            // native details would draw every cell, also in every shadow level.
+            _hasRendered |= IsReady || (_generator != null && BudgetLimited && ResidentCount > 0);
             IsRendering = IsReady || (_generator != null && _hasRendered);
             _treeRenderer.RenderingEnabled = _detailRenderer.RenderingEnabled = IsRendering;
             _treeRenderer.MaxDistance = _terrain.treeDistance;
@@ -551,6 +636,30 @@ namespace LoogaSoft.Terrain.Instances
                     }
                 }
             }
+        }
+
+        // Reads the heightmap texels under a detail patch once, when an observer first gathers the patch.
+        private void EnsureHeights(Cell cell)
+        {
+            if (cell.HasHeights) return;
+            int last = _data.heightmapResolution - 1;
+            float step = last / (float)_data.detailPatchCount;
+            int x0 = Mathf.Clamp(Mathf.FloorToInt(cell.Patch.x * step), 0, last);
+            int z0 = Mathf.Clamp(Mathf.FloorToInt(cell.Patch.y * step), 0, last);
+            int x1 = Mathf.Clamp(Mathf.CeilToInt((cell.Patch.x + 1) * step), x0, last);
+            int z1 = Mathf.Clamp(Mathf.CeilToInt((cell.Patch.y + 1) * step), z0, last);
+            float[,] heights = _data.GetHeights(x0, z0, x1 - x0 + 1, z1 - z0 + 1);
+            float min = float.PositiveInfinity;
+            float max = float.NegativeInfinity;
+            foreach (float height in heights)
+            {
+                min = Mathf.Min(min, height);
+                max = Mathf.Max(max, height);
+            }
+            float origin = _terrain.transform.position.y;
+            cell.MinY = origin + min * _data.size.y;
+            cell.MaxY = origin + max * _data.size.y;
+            cell.HasHeights = true;
         }
 
         private static int CompareCells(Cell a, Cell b)
@@ -674,8 +783,10 @@ namespace LoogaSoft.Terrain.Instances
                     if (cell.DetailTransforms == null)
                     {
                         double before = _watch.Elapsed.TotalMilliseconds;
-                        cell.DetailTransforms = _data.ComputeDetailInstanceTransforms(cell.Patch.x, cell.Patch.y, cell.Layer,
-                            _terrain.detailObjectDensity, out _);
+                        cell.DetailTransforms = ReplacedDetailLayers.IsReplaced(_terrain, cell.Layer)
+                            ? Array.Empty<DetailInstanceTransform>()
+                            : _data.ComputeDetailInstanceTransforms(cell.Patch.x, cell.Patch.y, cell.Layer,
+                                _terrain.detailObjectDensity, out _);
                         NativeReadMilliseconds += _watch.Elapsed.TotalMilliseconds - before;
                         PatchReads++;
                     }
@@ -697,7 +808,9 @@ namespace LoogaSoft.Terrain.Instances
                     EvictPrefetch();
                     if (ResidentCount >= _instanceLimit)
                     {
-                        throw new InvalidOperationException("Required vegetation exceeds the resident instance budget.");
+                        // The cell keeps its staged part and continues when evictions free space.
+                        BudgetLimited = true;
+                        return;
                     }
                 }
                 cell.Handles.Add(renderer.Add(type, matrix, appearance));
@@ -708,35 +821,69 @@ namespace LoogaSoft.Terrain.Instances
         }
 
         // Queue one GPU page for each nonempty layer. The cell is complete when SubmitGpuPages writes the pages.
-        private void StageGpu(Cell cell)
+        // A cell that does not fit the instance limit or the GPU reservation queues nothing, keeps no ranges and
+        // stays inactive.
+        private bool StageGpu(Cell cell, VegetationStreamingBudget budget)
         {
+            int firstPage = _generator.PageCount;
+            Span<int> counts = stackalloc int[_details.Length];
+            Span<int> outputs = stackalloc int[_details.Length];
+            int total = 0;
+            for (int layer = 0; layer < _details.Length; layer++)
+            {
+                counts[layer] = _generator.AddPage(cell.Patch, layer, out outputs[layer]);
+                total += counts[layer];
+            }
+            if (ResidentCount + total > _instanceLimit)
+            {
+                if (cell.Required)
+                {
+                    EvictPrefetch();
+                }
+                if (!cell.Required || ResidentCount + total > _instanceLimit)
+                {
+                    _generator.Truncate(firstPage);
+                    return false;
+                }
+            }
+            // A range can grow a population to the next power of two, and the storage trim keeps that capacity. So the
+            // cell must fit the GPU reservation, with eight view buffers, before it allocates.
+            if (ProjectedGpuBytesWith(counts) > budget.ResidentGpuBytes)
+            {
+                if (cell.Required)
+                {
+                    EvictPrefetch();
+                }
+                if (!cell.Required || ProjectedGpuBytesWith(counts) > budget.ResidentGpuBytes)
+                {
+                    _generator.Truncate(firstPage);
+                    _gpuReservationFull = true;
+                    _gpuReservationFullBudget = budget.ResidentGpuBytes;
+                    return false;
+                }
+            }
+            _active.Add(cell);
             Vector3 origin = _terrain.transform.position;
             var pivots = new Bounds(new Vector3(cell.Bounds.center.x, origin.y + _data.size.y * 0.5f, cell.Bounds.center.z),
                 new Vector3(cell.Bounds.size.x, _data.size.y, cell.Bounds.size.z));
             for (int layer = 0; layer < _details.Length; layer++)
             {
-                int count = _generator.AddPage(cell.Patch, layer, out int firstOutput);
-                if (count == 0) continue;
-                InstanceRange range = _detailRenderer.AllocateRange(_detailTypes[layer], count, pivots,
-                    _generator.MaximumScale);
+                if (counts[layer] == 0) continue;
+                InstanceRange range = _detailRenderer.AllocateRange(_detailTypes[layer], counts[layer], pivots,
+                    _generator.Reach);
                 cell.Ranges.Add(range);
-                _rangeWrites.Add(new InstanceRangeWrite(range, firstOutput));
-                ResidentCount += count;
+                _rangeWrites.Add(new InstanceRangeWrite(range, outputs[layer]));
             }
-            if (ResidentCount > _instanceLimit)
-            {
-                if (!cell.Required)
-                {
-                    Evict(cell);
-                    return;
-                }
-                EvictPrefetch();
-                if (ResidentCount > _instanceLimit)
-                {
-                    throw new InvalidOperationException("Required vegetation exceeds the resident instance budget.");
-                }
-            }
+            ResidentCount += total;
             Complete(cell);
+            return true;
+        }
+
+        // The projected GPU bytes after the detail ranges of one cell, one count for each layer.
+        private long ProjectedGpuBytesWith(ReadOnlySpan<int> counts)
+        {
+            return _treeRenderer.ProjectedGpuBytes() +
+                _detailRenderer.ProjectedGpuBytesAfterRanges(_detailTypes.AsSpan(0, counts.Length), counts);
         }
 
         // Place all queued pages and expand them into the detail renderer. Both steps run before later GPU work.
@@ -808,9 +955,12 @@ namespace LoogaSoft.Terrain.Instances
             cell.Complete = false;
             cell.Cursor = cell.Layer = 0;
             cell.DetailTransforms = null;
+            cell.HasHeights = false;
             ReleasePage(cell);
             Evictions++;
             _trimPending = true;
+            // The eviction frees GPU storage, so the next update can try the GPU reservation again.
+            _gpuReservationFull = false;
         }
 
         private void ReleasePage(Cell cell)

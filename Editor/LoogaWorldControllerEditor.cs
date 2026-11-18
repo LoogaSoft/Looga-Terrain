@@ -17,15 +17,21 @@ namespace LoogaSoft.Terrain.Editor
     {
         private List<VegetationCatalog.Entry> _catalog = new();
         private TerrainVegetationProvider[] _providers = Array.Empty<TerrainVegetationProvider>();
+        private InstanceSet[] _sets = Array.Empty<InstanceSet>();
+        private InstanceContainer[] _containers = Array.Empty<InstanceContainer>();
         private readonly Dictionary<UnityEngine.Object, Texture> _tilePreviews = new();
         private readonly HashSet<UnityEngine.Object> _pendingPreviews = new();
+        private readonly Dictionary<TerrainRendererSettings, UnityEditor.Editor> _settingsEditors = new();
+        private readonly HashSet<TerrainRendererSettings> _expandedSettings = new();
         private VegetationCatalog.Entry _selected;
         private string _error;
         private bool _worldOptions;
         private bool _details = true;
         private bool _trees;
+        private bool _objects;
         private bool _detailDefaults;
         private bool _treeDefaults;
+        private bool _objectDefaults;
         private bool _diagnostics;
         private bool _usage;
         private Camera _camera;
@@ -51,6 +57,11 @@ namespace LoogaSoft.Terrain.Editor
             Undo.undoRedoPerformed -= OnUndo;
             StopPreviewLoading();
             _tilePreviews.Clear();
+            foreach (UnityEditor.Editor editor in _settingsEditors.Values)
+            {
+                DestroyImmediate(editor);
+            }
+            _settingsEditors.Clear();
         }
 
         private void OnUndo()
@@ -73,6 +84,8 @@ namespace LoogaSoft.Terrain.Editor
             {
                 StopPreviewLoading();
                 _providers = Array.Empty<TerrainVegetationProvider>();
+                _sets = Array.Empty<InstanceSet>();
+                _containers = Array.Empty<InstanceContainer>();
                 _catalog = new List<VegetationCatalog.Entry>();
                 _selected = null;
                 _tilePreviews.Clear();
@@ -80,8 +93,10 @@ namespace LoogaSoft.Terrain.Editor
             }
             var previous = _selected;
             _providers = controller.GetVegetationProviders();
+            _sets = controller.GetInstanceSets();
+            _containers = controller.GetInstanceContainers();
             _providersDirty = false;
-            _catalog = VegetationCatalog.Build(_providers);
+            _catalog = VegetationCatalog.Build(_providers, _sets, _containers);
             _selected = previous == null ? null : _catalog.Find(e => e.Kind == previous.Kind && e.Source == previous.Source);
             _camera = _camera ? _camera : Camera.main;
             _tilePreviews.Clear();
@@ -90,18 +105,21 @@ namespace LoogaSoft.Terrain.Editor
 
         public override void OnInspectorGUI()
         {
+            LoogaBanner.DrawFor(target.GetType());
             var controller = (LoogaWorldController)target;
             if (_providersDirty) Refresh();
             serializedObject.Update();
             _worldOptions = LoogaGUILayout.Foldout("World Setup", _worldOptions, () =>
             {
-                DrawPropertiesExcluding(serializedObject, "m_Script", "_vegetationSettings", "_previewVegetationInEditor");
+                DrawPropertiesExcluding(serializedObject, "m_Script", "_vegetationSettings", "_previewVegetationInEditor",
+                    "_terrainSettings", "_terrainGroups");
                 serializedObject.ApplyModifiedProperties();
                 if (!string.IsNullOrEmpty(controller.LastReport)) EditorGUILayout.HelpBox(controller.LastReport, MessageType.Info);
                 if (GUILayout.Button("Configure World")) { LoogaWorldSetupUtility.Configure(controller); Refresh(); }
                 if (GUILayout.Button("Validate Setup")) LoogaWorldSetupUtility.Validate(controller);
                 if (GUILayout.Button("Restore Native Rendering")) LoogaWorldSetupUtility.RestoreNative(controller);
             });
+            DrawTerrainSettings(controller);
             EditorGUILayout.LabelField("Vegetation", EditorStyles.boldLabel);
             TerrainVegetationPreview.DrawControls(controller);
             var profile = controller.VegetationSettings;
@@ -114,7 +132,8 @@ namespace LoogaSoft.Terrain.Editor
             }
             if (!profile)
             {
-                EditorGUILayout.HelpBox("Each terrain uses its local settings. Create or assign a shared profile to control this world's details and trees.", MessageType.Info);
+                EditorGUILayout.HelpBox("Each terrain, InstanceSet and InstanceContainer uses its local settings. " +
+                    "Create or assign a shared profile to control the details, trees and objects of this world.", MessageType.Info);
                 if (GUILayout.Button("Create shared vegetation settings"))
                 {
                     string path = EditorUtility.SaveFilePanelInProject("Create vegetation settings", "VegetationSettings", "asset", "Choose a shared profile location.");
@@ -126,6 +145,12 @@ namespace LoogaSoft.Terrain.Editor
                         {
                             created.SetDefaults(VegetationKind.Detail, provider.LocalDetailQuality);
                             created.SetDefaults(VegetationKind.Tree, provider.LocalTreeQuality);
+                        }
+                        // The first set keeps its current look when the shared profile replaces its local quality.
+                        var set = _sets.FirstOrDefault(item => item);
+                        if (set)
+                        {
+                            created.SetDefaults(VegetationKind.Object, set.Quality);
                         }
                         AssetDatabase.CreateAsset(created, path);
                         Assign(controller, created);
@@ -144,11 +169,15 @@ namespace LoogaSoft.Terrain.Editor
                 () => DrawCategory(profile, VegetationKind.Detail));
             _trees = LoogaGUILayout.Foldout(new GUIContent("Trees (" + CountSources(VegetationKind.Tree) + ")"), _trees,
                 () => DrawCategory(profile, VegetationKind.Tree));
+            _objects = LoogaGUILayout.Foldout(new GUIContent("Objects (" + CountSources(VegetationKind.Object) + ")"),
+                _objects, () => DrawCategory(profile, VegetationKind.Object));
             _diagnostics = LoogaGUILayout.Foldout("Diagnostics", _diagnostics, () =>
             {
                 var pipeline = UnityEngine.Rendering.GraphicsSettings.currentRenderPipeline as UniversalRenderPipelineAsset;
                 if (pipeline) EditorGUILayout.LabelField("URP shadow cap", pipeline.shadowDistance.ToString("0.#") + " m");
-                EditorGUILayout.HelpBox("Detail counts are paint units, not generated blades. Loaded counts are resident placements. Visible counts are on-demand camera samples and can stall the GPU. Scene InstanceContainers are separate from terrain prototypes.", MessageType.None);
+                EditorGUILayout.HelpBox("Detail counts are paint units, not generated blades. Loaded counts are resident placements. " +
+                    "Visible counts are on-demand camera samples and can stall the GPU. " +
+                    "Objects are the prefabs of InstanceSets and InstanceContainers. They are not terrain data.", MessageType.None);
             });
             foreach (var provider in _providers)
             {
@@ -162,9 +191,68 @@ namespace LoogaSoft.Terrain.Editor
             if (!string.IsNullOrEmpty(_error)) EditorGUILayout.HelpBox(_error, MessageType.Error);
         }
 
+        // Shared renderer settings: the assignment rules, then the values of each settings asset in use.
+        private void DrawTerrainSettings(LoogaWorldController controller)
+        {
+            EditorGUILayout.LabelField("Terrain Rendering", EditorStyles.boldLabel);
+            serializedObject.Update();
+            EditorGUI.BeginChangeCheck();
+            EditorGUILayout.PropertyField(serializedObject.FindProperty("_terrainSettings"));
+            EditorGUILayout.PropertyField(serializedObject.FindProperty("_terrainGroups"), true);
+            if (EditorGUI.EndChangeCheck())
+            {
+                serializedObject.ApplyModifiedProperties();
+                TerrainRenderer[] renderers = controller.GetTerrainRenderers();
+                Undo.RecordObjects(renderers, "Assign terrain renderer settings");
+                Try(() => controller.ApplyTerrainSettings());
+                foreach (TerrainRenderer renderer in renderers)
+                {
+                    EditorUtility.SetDirty(renderer);
+                }
+            }
+            int local = 0;
+            var usage = new Dictionary<TerrainRendererSettings, int>();
+            foreach (TerrainRenderer renderer in controller.GetTerrainRenderers())
+            {
+                if (!renderer.Settings)
+                {
+                    local++;
+                    continue;
+                }
+                usage.TryGetValue(renderer.Settings, out int count);
+                usage[renderer.Settings] = count + 1;
+            }
+            foreach (KeyValuePair<TerrainRendererSettings, int> entry in usage)
+            {
+                bool expanded = _expandedSettings.Contains(entry.Key);
+                bool next = LoogaGUILayout.Foldout(new GUIContent(entry.Key.name + " (" + entry.Value + " terrains)"),
+                    expanded, () =>
+                    {
+                        if (!_settingsEditors.TryGetValue(entry.Key, out UnityEditor.Editor editor) || !editor)
+                        {
+                            editor = CreateEditor(entry.Key);
+                            _settingsEditors[entry.Key] = editor;
+                        }
+                        editor.OnInspectorGUI();
+                    });
+                if (next) _expandedSettings.Add(entry.Key);
+                else _expandedSettings.Remove(entry.Key);
+            }
+            if (local > 0)
+            {
+                EditorGUILayout.HelpBox(local + " terrains use the values of their TerrainRenderer component.",
+                    MessageType.None);
+            }
+            if (usage.Count > 0)
+            {
+                EditorGUILayout.HelpBox("Edits to a settings asset change every terrain that uses it.",
+                    MessageType.None);
+            }
+        }
+
         internal static void DrawDefaults(VegetationSettings profile, VegetationKind kind, ref string error)
         {
-            InstanceQualitySettings quality = kind == VegetationKind.Detail ? profile.DetailDefaults : profile.TreeDefaults;
+            InstanceQualitySettings quality = profile.GetDefaults(kind);
             var fields = VegetationQualityFields.None;
             if (!VegetationQualityGUI.Draw(ref quality, false, ref fields)) return;
             Undo.RecordObject(profile, "Change vegetation defaults");
@@ -177,11 +265,16 @@ namespace LoogaSoft.Terrain.Editor
             Try(() =>
             {
                 Undo.RecordObject(controller, "Assign vegetation settings");
-                var providers = controller.GetVegetationProviders();
-                Undo.RecordObjects(providers, "Assign vegetation settings");
+                var sources = new List<UnityEngine.Object>(controller.GetVegetationProviders());
+                sources.AddRange(controller.GetInstanceSets());
+                sources.AddRange(controller.GetInstanceContainers());
+                Undo.RecordObjects(sources.ToArray(), "Assign vegetation settings");
                 controller.SetVegetationSettings(settings);
                 EditorUtility.SetDirty(controller);
-                foreach (var provider in providers) EditorUtility.SetDirty(provider);
+                foreach (var source in sources)
+                {
+                    EditorUtility.SetDirty(source);
+                }
                 EditorSceneManager.MarkSceneDirty(controller.gameObject.scene);
                 Refresh();
             });
@@ -281,7 +374,12 @@ namespace LoogaSoft.Terrain.Editor
         {
             var entries = _catalog.Where(entry => entry.Kind == kind && entry.Source).ToList();
             DrawCategorySummary(profile, kind, entries);
-            EditorGUILayout.LabelField("Terrain sources", EditorStyles.boldLabel);
+            if (kind == VegetationKind.Object)
+            {
+                DrawObjectOwnerStatus(profile);
+            }
+            EditorGUILayout.LabelField(kind == VegetationKind.Object ? "Object sources" : "Terrain sources",
+                EditorStyles.boldLabel);
             DrawTiles(entries);
             if (_selected != null && !_selected.Source) _selected = null;
             if (_selected != null && _selected.Kind == kind)
@@ -291,34 +389,83 @@ namespace LoogaSoft.Terrain.Editor
                 EditorGUILayout.EndVertical();
             }
             if (!profile) return;
-            if (kind == VegetationKind.Detail)
+            switch (kind)
             {
-                _detailDefaults = LoogaGUILayout.Foldout("Defaults", _detailDefaults,
-                    () => DrawDefaults(profile, kind, ref _error));
+                case VegetationKind.Detail:
+                    _detailDefaults = LoogaGUILayout.Foldout("Defaults", _detailDefaults,
+                        () => DrawDefaults(profile, kind, ref _error));
+                    break;
+                case VegetationKind.Tree:
+                    _treeDefaults = LoogaGUILayout.Foldout("Defaults", _treeDefaults,
+                        () => DrawDefaults(profile, kind, ref _error));
+                    break;
+                default:
+                    _objectDefaults = LoogaGUILayout.Foldout("Defaults", _objectDefaults,
+                        () => DrawDefaults(profile, kind, ref _error));
+                    break;
             }
-            else
+        }
+
+        // Object sources get the shared profile only from Assign or ApplyVegetationSettings. A set that a tool creates
+        // later keeps its local quality until then.
+        private void DrawObjectOwnerStatus(VegetationSettings profile)
+        {
+            var owners = new List<Component>();
+            owners.AddRange(_sets.Where(set => set && set.QualitySource != profile));
+            owners.AddRange(_containers.Where(container => container && container.QualitySource != profile));
+            if (owners.Count > 0)
             {
-                _treeDefaults = LoogaGUILayout.Foldout("Defaults", _treeDefaults,
-                    () => DrawDefaults(profile, kind, ref _error));
+                string message = profile
+                    ? owners.Count + " object owners do not use the shared settings: "
+                    : owners.Count + " object owners use another quality source: ";
+                EditorGUILayout.HelpBox(message + string.Join(", ", owners.Select(owner => owner.name)) + ".",
+                    MessageType.Warning);
+                if (GUILayout.Button(profile ? "Use shared settings for all objects" : "Use local settings for all objects"))
+                {
+                    Assign((LoogaWorldController)target, profile);
+                    // The assignment rebuilds the catalog, so the rest of this layout pass is not valid.
+                    GUIUtility.ExitGUI();
+                }
+            }
+            foreach (Component owner in _sets.Cast<Component>().Concat(_containers))
+            {
+                if (!owner) continue;
+                string diagnostic = owner is InstanceSet set ? set.Diagnostic : ((InstanceContainer)owner).Diagnostic;
+                if (!string.IsNullOrEmpty(diagnostic))
+                {
+                    EditorGUILayout.HelpBox(owner.name + ": " + diagnostic, MessageType.Warning);
+                }
             }
         }
 
         private void DrawCategorySummary(VegetationSettings profile, VegetationKind kind,
             IReadOnlyList<VegetationCatalog.Entry> entries)
         {
-            int terrains = entries.SelectMany(entry => entry.Usages.Select(usage => usage.Provider))
-                .Where(provider => provider).Distinct().Count();
             bool counted = entries.All(entry => entry.SourceCount.HasValue);
             long sourceCount = counted ? entries.Sum(entry => entry.SourceCount.Value) : 0;
-            string countLabel = kind == VegetationKind.Detail ? "Paint units" : "Source placements";
-            EditorGUILayout.LabelField(entries.Count + " sources across " + terrains + " terrains  |  " +
-                countLabel + ": " + (counted ? sourceCount.ToString("N0") : "uncounted"),
+            string location;
+            if (kind == VegetationKind.Object)
+            {
+                int owners = entries.SelectMany(entry => entry.Usages.Select(usage => usage.Owner))
+                    .Where(owner => owner).Distinct().Count();
+                location = " in " + owners + (owners == 1 ? " owner" : " owners") + " (InstanceSet or InstanceContainer)";
+            }
+            else
+            {
+                int terrains = entries.SelectMany(entry => entry.Usages.Select(usage => usage.Provider))
+                    .Where(provider => provider).Distinct().Count();
+                location = " across " + terrains + " terrains";
+            }
+            EditorGUILayout.LabelField(entries.Count + " sources" + location + "  |  " +
+                VegetationCatalog.GetCountLabel(kind) + ": " + (counted ? sourceCount.ToString("N0") : "uncounted"),
                 EditorStyles.wordWrappedMiniLabel);
             if (!profile) return;
-            InstanceQualitySettings quality = kind == VegetationKind.Detail ? profile.DetailDefaults : profile.TreeDefaults;
-            string view = quality.ViewDistance > 0 ? quality.ViewDistance.ToString("0.#") + " m" : "native terrain";
+            InstanceQualitySettings quality = profile.GetDefaults(kind);
+            string view = quality.ViewDistance > 0 ? quality.ViewDistance.ToString("0.#") + " m" :
+                kind == VegetationKind.Object ? "owner limit" : "native terrain";
             string shadow = quality.ShadowMode == InstanceShadowMode.Off ? "Off" :
-                quality.ShadowDistance > 0 ? quality.ShadowDistance.ToString("0.#") + " m" : "provider cap";
+                quality.ShadowDistance > 0 ? quality.ShadowDistance.ToString("0.#") + " m" :
+                kind == VegetationKind.Object ? "owner cap" : "provider cap";
             EditorGUILayout.LabelField("Default view: " + view + "  |  Shadow: " + shadow,
                 EditorStyles.wordWrappedMiniLabel);
             EditorGUILayout.Space(5f);
@@ -328,7 +475,7 @@ namespace LoogaSoft.Terrain.Editor
         {
             if (entries.Count == 0)
             {
-                EditorGUILayout.HelpBox("No terrain sources in this category.", MessageType.None);
+                EditorGUILayout.HelpBox("No sources in this category.", MessageType.None);
                 return;
             }
 
@@ -384,10 +531,14 @@ namespace LoogaSoft.Terrain.Editor
             EditorGUILayout.Space();
             EditorGUILayout.LabelField(entry.Source.name, EditorStyles.boldLabel);
             EditorGUILayout.ObjectField("Source asset", entry.Source, typeof(UnityEngine.Object), false);
-            EditorGUILayout.LabelField(entry.Usages.Select(usage => usage.Provider).Where(provider => provider).Distinct().Count() +
-                " terrains  |  " + entry.CountLabel + ": " + (entry.SourceCount?.ToString("N0") ?? "uncounted") +
-                "  |  Loaded: " + entry.GetResidentCount().ToString("N0") +
-                "  |  Visible: " + (entry.VisibleCount?.ToString("N0") ?? "unsampled"), EditorStyles.wordWrappedMiniLabel);
+            bool isObject = entry.Kind == VegetationKind.Object;
+            string location = isObject
+                ? entry.Usages.Select(usage => usage.Owner).Where(owner => owner).Distinct().Count() + " owners"
+                : entry.Usages.Select(usage => usage.Provider).Where(provider => provider).Distinct().Count() + " terrains";
+            string visible = isObject ? "" : "  |  Visible: " + (entry.VisibleCount?.ToString("N0") ?? "unsampled");
+            EditorGUILayout.LabelField(location + "  |  " + entry.CountLabel + ": " +
+                (entry.SourceCount?.ToString("N0") ?? "uncounted") +
+                "  |  Loaded: " + entry.GetResidentCount().ToString("N0") + visible, EditorStyles.wordWrappedMiniLabel);
             EditorGUILayout.BeginHorizontal();
             if (GUILayout.Button("Ping asset")) EditorGUIUtility.PingObject(entry.Source);
             if (GUILayout.Button("Select asset")) Selection.activeObject = entry.Source;
@@ -397,20 +548,33 @@ namespace LoogaSoft.Terrain.Editor
                 foreach (Material material in prefab.GetComponentsInChildren<Renderer>(true).SelectMany(r => r.sharedMaterials).Where(m => m).Distinct())
                     EditorGUILayout.ObjectField("Material", material, typeof(Material), false);
             }
-            _usage = LoogaGUILayout.Foldout("Terrain usage", _usage, () =>
+            _usage = LoogaGUILayout.Foldout(isObject ? "Owners" : "Terrain usage", _usage, () =>
             {
                 foreach (var usage in entry.Usages)
-                    if (usage.Provider) EditorGUILayout.ObjectField("Slot " + usage.PrototypeIndex, usage.Provider, typeof(TerrainVegetationProvider), true);
+                {
+                    if (usage.Provider)
+                    {
+                        EditorGUILayout.ObjectField("Slot " + usage.PrototypeIndex, usage.Provider,
+                            typeof(TerrainVegetationProvider), true);
+                    }
+                    else if (usage.Owner)
+                    {
+                        EditorGUILayout.ObjectField(usage.Owner.GetType().Name, usage.Owner, typeof(Component), true);
+                    }
+                }
             });
-            EditorGUI.BeginChangeCheck();
-            _camera = (Camera)EditorGUILayout.ObjectField("Diagnostic camera", _camera, typeof(Camera), true);
-            if (EditorGUI.EndChangeCheck())
+            if (!isObject)
             {
-                foreach (var item in _catalog) item.VisibleCount = null;
-            }
-            using (new EditorGUI.DisabledScope(!Application.isPlaying || !_camera))
-            {
-                if (GUILayout.Button("Sample visible placements")) Try(() => entry.ReadVisibleCount(_camera));
+                EditorGUI.BeginChangeCheck();
+                _camera = (Camera)EditorGUILayout.ObjectField("Diagnostic camera", _camera, typeof(Camera), true);
+                if (EditorGUI.EndChangeCheck())
+                {
+                    foreach (var item in _catalog) item.VisibleCount = null;
+                }
+                using (new EditorGUI.DisabledScope(!Application.isPlaying || !_camera))
+                {
+                    if (GUILayout.Button("Sample visible placements")) Try(() => entry.ReadVisibleCount(_camera));
+                }
             }
             if (!profile) return;
             EditorGUILayout.LabelField("Source overrides", EditorStyles.boldLabel);
@@ -425,12 +589,7 @@ namespace LoogaSoft.Terrain.Editor
                 int validUsages = 0;
                 foreach (var usage in entry.Usages)
                 {
-                    if (!usage.Provider) continue;
-                    var terrain = usage.Provider.GetComponent<UnityEngine.Terrain>();
-                    if (!terrain) continue;
-                    float view = quality.ViewDistance > 0 ? quality.ViewDistance :
-                        entry.Kind == VegetationKind.Detail ? terrain.detailObjectDistance : terrain.treeDistance;
-                    float shadow = quality.ShadowDistance > 0 ? Mathf.Min(quality.ShadowDistance, usage.Provider.ShadowDistanceLimit) : usage.Provider.ShadowDistanceLimit;
+                    if (!TryGetUsageRange(entry.Kind, usage, quality, out float view, out float shadow)) continue;
                     if (pipeline) shadow = Mathf.Min(shadow, pipeline.shadowDistance);
                     minView = Mathf.Min(minView, view); maxView = Mathf.Max(maxView, view);
                     minShadow = Mathf.Min(minShadow, shadow); maxShadow = Mathf.Max(maxShadow, shadow);
@@ -454,6 +613,48 @@ namespace LoogaSoft.Terrain.Editor
                 }
             }
             catch (Exception exception) { _error = exception.Message; }
+        }
+
+        // Mirrors the limits of InstanceRenderer: a set or container view limit applies only without a source view
+        // distance, and the shadow range never exceeds the view limit of the owner.
+        private static bool TryGetUsageRange(VegetationKind kind, VegetationCatalog.Usage usage,
+            InstanceQualitySettings quality, out float view, out float shadow)
+        {
+            view = shadow = 0;
+            float ownerView;
+            float ownerShadow;
+            if (usage.Provider)
+            {
+                var terrain = usage.Provider.GetComponent<UnityEngine.Terrain>();
+                if (!terrain) return false;
+                view = quality.ViewDistance > 0 ? quality.ViewDistance :
+                    kind == VegetationKind.Detail ? terrain.detailObjectDistance : terrain.treeDistance;
+                shadow = quality.ShadowDistance > 0
+                    ? Mathf.Min(quality.ShadowDistance, usage.Provider.ShadowDistanceLimit)
+                    : usage.Provider.ShadowDistanceLimit;
+                return true;
+            }
+            if (usage.Owner is InstanceSet set && set)
+            {
+                ownerView = set.MaxDistance;
+                ownerShadow = set.ShadowDistance;
+            }
+            else if (usage.Owner is InstanceContainer container && container)
+            {
+                ownerView = container.MaxDistance;
+                ownerShadow = container.ShadowDistance;
+            }
+            else
+            {
+                return false;
+            }
+            view = quality.ViewDistance > 0 ? quality.ViewDistance : ownerView;
+            shadow = Mathf.Min(ownerView, ownerShadow);
+            if (quality.ShadowDistance > 0)
+            {
+                shadow = Mathf.Min(shadow, quality.ShadowDistance);
+            }
+            return true;
         }
 
         private void Try(Action action)

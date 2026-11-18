@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using LoogaSoft.Instancing;
 using Unity.Collections;
 using Unity.Mathematics;
+using Unity.Profiling;
 using UnityEngine;
 using UnityEngine.Splines;
 
@@ -104,6 +105,7 @@ namespace LoogaSoft.Terrain.Geology
 
         private void Rebuild(bool forceWholeSpline)
         {
+            using ProfilerMarker.AutoScope build = LoogaGeologyMarkers.BasaltEscarpmentBuild.Auto();
             Release();
             Diagnostic = null;
             if (!isActiveAndEnabled)

@@ -1,0 +1,1390 @@
+// Builds the signed distance field of a rock on a 3D grid. Values are negative in the rock and positive in the air.
+// BaseShape writes the first field. Each other kernel reads _Source and writes _Field, so a pass can read any sample of
+// the field before it. RockField swaps the two buffers after each dispatch.
+#pragma kernel BaseShape
+#pragma kernel SlicePass
+#pragma kernel BulgePass
+#pragma kernel FracturePass
+#pragma kernel NoisePass
+#pragma kernel JointPass
+#pragma kernel CellPass
+#pragma kernel CutPass
+#pragma kernel SplitPass
+#pragma kernel CrackPass
+#pragma kernel CrackLines
+#pragma kernel CarvePass
+#pragma kernel OpenFinish
+#pragma kernel ClampCarve
+#pragma kernel BlurPass
+#pragma kernel SmoothPass
+#pragma kernel OffsetPass
+#pragma kernel RedistanceSeed
+#pragma kernel RedistanceSweep
+#pragma kernel RedistanceFinish
+#pragma kernel FractureVolume
+#pragma kernel DisplacePass
+#pragma kernel FaceDisplacePass
+
+RWStructuredBuffer<float> _Field;
+// A random value of the block at each sample near the surface. The vertices read it for the block color.
+RWStructuredBuffer<float> _Tags;
+// 1 on the cell borders of a main cut, and 0 on the middle of its cells. Fine damage reads this, so the middles stay flat.
+RWStructuredBuffer<float> _EdgeMaskOut;
+StructuredBuffer<float> _EdgeMask;
+StructuredBuffer<float> _Source;
+// The source field after BlurPass. Used only when _EdgeFocus or a smooth pass needs it.
+StructuredBuffer<float> _Blurred;
+// The base shape before the passes. Carving stops at _MaxCarve below this surface, so a solid core remains.
+StructuredBuffer<float> _Base;
+// The nearest surface point of each sample, for the distance rebuild.
+RWStructuredBuffer<float3> _NearestOut;
+StructuredBuffer<float3> _NearestIn;
+StructuredBuffer<float4> _Planes;
+
+int3 _Size;
+// First Z sample of this dispatch. RockField runs each kernel in short slices of the grid.
+int _SliceStart;
+float3 _Origin;
+float _CellSize;
+int _Seed;
+
+// Each block is the intersection of the half spaces of its planes. The plane xyz is the outward normal. The plane w
+// is the distance from the origin along the normal.
+int _BlockCount;
+int _PlanesPerBlock;
+
+// A pass with an edge focus acts mostly near convex edges. The focus reads _Blurred.
+float _EdgeFocus;
+float _EdgeRange;
+
+// A warp moves the position before a pass, so straight joints and cracks wander.
+float _WarpAmount;
+float _WarpFrequency;
+
+float _Amount;
+float3 _NoiseScale;
+int _CarveOnly;
+float _DistanceScale;
+float _Frequency;
+int _Octaves;
+float _Lacunarity;
+float _Gain;
+float _Ridged;
+// Smooth and rough patches: a broad noise scales the small layers of the noise pass.
+float _PatchFrequency;
+float _PatchContrast;
+
+// Joint sets in the turned frame. Y is the first set, X the second and Z the third. A spacing of 0 turns a set off.
+float4x4 _Frame;
+float3 _Spacing;
+float3 _Gap;
+float _SpacingJitter;
+float _RowShift;
+float _Core;
+// Depth of the solid rock under the old surface. It must pass the joints: a block face can lie deep below the old surface,
+// and a shallow solid then bulges through the face.
+float _Solid;
+float _Persistence;
+float _Rounding;
+float _Overlap;
+float _Tilt;
+float _Relief;
+float _Follow;
+float _KeepJitter;
+float _KeepMargin;
+// Slope of each block face. Opposite faces then do not lie parallel, so blocks are wedges and not boxes.
+float _FaceTilt;
+// Width of the smooth union of blocks at a closed joint, in meters.
+float _Blend;
+float _Missing;
+// Largest change of the size of a row, for example 0.2 for 0.8 to 1.2 times.
+float _RowScale;
+int _WriteTags;
+float _Reach;
+
+float3 _CellScale;
+float _CellJitter;
+float _CrackWidth;
+// Rounded wear of the lips of fracture cracks, 0 to 1.
+float _CrackWeathering;
+
+// Cracks pass: a tree of cracks that split the rock in order. A parent comes before its children.
+struct CrackNode
+{
+    float3 position;
+    float generation;
+    float3 normal;
+    int parent;
+    int side;
+    int seed;
+};
+StructuredBuffer<CrackNode> _CrackNodes;
+int _CrackNodeCount;
+// Share of width, depth and weathering that each younger generation keeps.
+float _CrackAge;
+// Largest bend of a crack face in meters, and one over its size.
+float _CrackRough;
+float _CrackRoughFrequency;
+// Crack lines: points and normals of the mesh, and the distance of each point to its crack.
+StructuredBuffer<float3> _CrackPoints;
+StructuredBuffer<float3> _CrackNormals;
+RWStructuredBuffer<float> _CrackLineDistances;
+int _CrackPointCount;
+float _CrackDepth;
+float _CrackProfile;
+float _CellOffset;
+float _Facet;
+float _Horizontal;
+float _CutDepth;
+// Above 1, most cut cells stay shallow and few go deep.
+float _CutDepthPower;
+// Above 0, the depth of a cell falls on this many even levels, so plates come off at the same depth as cleaved rock.
+int _CutLevels;
+float _MaxCarve;
+int _WriteEdgeMask;
+float _EdgeMaskWidth;
+int _UseEdgeMask;
+// 0 = a crack on all cell borders. Higher values keep only the peaks of a noise, so cracks are sparse.
+float _Sparsity;
+// Finite fractures, as in a discrete fracture network (Baecher model): each is a planar disc that ends in intact rock. A
+// closed cell border cannot end, and a rock full of closed cells looks like a pattern.
+struct Fracture
+{
+    float3 center;
+    float3 along;
+    float3 normal;
+    float halfLength;
+    float halfWidth;
+    float stepDepth;
+    float stepFade;
+    float crackWidth;
+    float crackDepth;
+    float endFade;
+    float3 endAxis;
+    float endReach;
+    float row;
+    float headFade;
+    float tailFade;
+};
+StructuredBuffer<Fracture> _Fractures;
+// The split tree of SplitPass. A child is a node index, or ~index of a leaf.
+struct SplitNode
+{
+    float3 normal;
+    float offset;
+    int low;
+    int high;
+};
+struct SplitLeaf
+{
+    float3 center;
+    float depth;
+    float3 slope;
+    float spare;
+};
+StructuredBuffer<SplitNode> _SplitNodes;
+StructuredBuffer<SplitLeaf> _SplitLeaves;
+int _FractureCount;
+// The fracture volume, packed as four bytes for each sample. x signed band, y distance range, w ledge run range, in meters.
+RWStructuredBuffer<uint> _VolumeOut;
+float4 _VolumeRange;
+// Largest sum of the fracture steps at one sample, in meters. 0 turns the limit off.
+float _StepLimit;
+// Change of the step along a fracture, as a share of the step.
+float _StepBreakup;
+float _StepBreakupRate;
+// A plane xyz with its distance in w. Rock on the outer side of the plane goes.
+float4 _Slice;
+// A soft bulge of the base: center in xyz, height in w, and the reach on each axis.
+float4 _BulgeCenter;
+float3 _BulgeReach;
+float _BulgeFlat;
+float _CutLimit;
+float _ClipLevel;
+float _ClipWidth;
+float _CutShare;
+
+int3 _BlurAxis;
+int _BlurRadius;
+float _BlurSigma;
+
+float _Wear;
+float _Fill;
+float _Patchy;
+// Length of a jump of the distance rebuild, in samples.
+int _JumpLength;
+
+int FieldIndex(int3 id)
+{
+    return id.x + _Size.x * (id.y + _Size.y * id.z);
+}
+
+float3 SamplePosition(uint3 id)
+{
+    return _Origin + float3(id) * _CellSize;
+}
+
+// PCG3D hash (Jarzynski and Olano 2020). The hash uses integers, so the noise has no float precision limit far from
+// the origin.
+uint3 Hash(int3 cell)
+{
+    uint3 value = uint3(cell) * 1664525u + 1013904223u;
+    value.x += value.y * value.z;
+    value.y += value.z * value.x;
+    value.z += value.x * value.y;
+    value ^= value >> 16u;
+    value.x += value.y * value.z;
+    value.y += value.z * value.x;
+    value.z += value.x * value.y;
+    return value;
+}
+
+// Three random values from 0 to 1.
+float3 Chance(int3 cell)
+{
+    return float3(Hash(cell) >> 16u) / 65535.0;
+}
+
+float CornerValue(int3 cell, int3 corner, float3 offset, int seed)
+{
+    uint3 hash = Hash(cell + corner + seed);
+    float3 gradient = normalize(float3(hash >> 16u) / 32767.5 - 1.0 + 1e-5);
+    return dot(gradient, offset - float3(corner));
+}
+
+// Perlin gradient noise with the quintic fade.
+float GradientNoise(float3 position, int seed)
+{
+    float3 floorPosition = floor(position);
+    int3 cell = int3(floorPosition);
+    float3 offset = position - floorPosition;
+    float3 fade = offset * offset * offset * (offset * (offset * 6.0 - 15.0) + 10.0);
+    float x00 = lerp(CornerValue(cell, int3(0, 0, 0), offset, seed), CornerValue(cell, int3(1, 0, 0), offset, seed), fade.x);
+    float x10 = lerp(CornerValue(cell, int3(0, 1, 0), offset, seed), CornerValue(cell, int3(1, 1, 0), offset, seed), fade.x);
+    float x01 = lerp(CornerValue(cell, int3(0, 0, 1), offset, seed), CornerValue(cell, int3(1, 0, 1), offset, seed), fade.x);
+    float x11 = lerp(CornerValue(cell, int3(0, 1, 1), offset, seed), CornerValue(cell, int3(1, 1, 1), offset, seed), fade.x);
+    return lerp(lerp(x00, x10, fade.y), lerp(x01, x11, fade.y), fade.z);
+}
+
+static const float3 NoPoint = float3(1e9, 0.0, 0.0);
+
+// Layered noise. Each layer turns, so the layers do not line up along the grid axes of the noise. The detail scale multiplies
+// all layers after the first.
+float LayeredNoise(float3 position, float detailScale)
+{
+    static const float3x3 Turn = float3x3(0.80, 0.36, -0.48, -0.60, 0.48, -0.64, 0.00, 0.80, 0.60);
+    float sum = 0.0;
+    float amplitude = 1.0;
+    float total = 0.0;
+    float3 location = position * _Frequency;
+    for (int octave = 0; octave < _Octaves; octave++)
+    {
+        float value = GradientNoise(location, _Seed + octave * 131);
+        // A ridged layer has a crease where the noise crosses zero.
+        sum += amplitude * lerp(value, 0.35 - 2.0 * abs(value), _Ridged) * (octave == 0 ? 1.0 : detailScale);
+        total += amplitude;
+        amplitude *= _Gain;
+        location = mul(Turn, location) * _Lacunarity;
+    }
+    // Layered gradient noise rarely passes 0.5, so this factor brings the amount close to the real change.
+    return 2.0 * sum / total;
+}
+
+float3 Warp(float3 position)
+{
+    if (_WarpAmount <= 0.0) return position;
+    float3 location = position * _WarpFrequency;
+    float3 offset = float3(
+        GradientNoise(location, _Seed + 401), GradientNoise(location, _Seed + 577), GradientNoise(location, _Seed + 733));
+    location = location * 2.3 + 7.1;
+    offset += 0.5 * float3(
+        GradientNoise(location, _Seed + 811), GradientNoise(location, _Seed + 977), GradientNoise(location, _Seed + 1103));
+    return position + offset * 1.5 * _WarpAmount;
+}
+
+// 1 where the pass acts at full strength. The blurred field passes the field at convex edges and on thin parts, so this
+// also measures local thickness. A positive focus acts on those parts. A negative focus protects them, which stops a
+// pass from tearing thin parts while flat faces keep the full strength.
+float EdgeShare(int index, float field)
+{
+    if (_EdgeFocus == 0.0) return 1.0;
+    float exposed = saturate((_Blurred[index] - field) / _EdgeRange);
+    return _EdgeFocus > 0.0 ? lerp(1.0, exposed, _EdgeFocus) : 1.0 + _EdgeFocus * exposed;
+}
+
+// Trilinear sample of the source field at a world position.
+float SampleSource(float3 position)
+{
+    float3 grid = clamp((position - _Origin) / _CellSize, 0.0, float3(_Size - 2));
+    int3 low = int3(grid);
+    float3 share = grid - float3(low);
+    float x00 = lerp(_Source[FieldIndex(low)], _Source[FieldIndex(low + int3(1, 0, 0))], share.x);
+    float x10 = lerp(_Source[FieldIndex(low + int3(0, 1, 0))], _Source[FieldIndex(low + int3(1, 1, 0))], share.x);
+    float x01 = lerp(_Source[FieldIndex(low + int3(0, 0, 1))], _Source[FieldIndex(low + int3(1, 0, 1))], share.x);
+    float x11 = lerp(_Source[FieldIndex(low + int3(0, 1, 1))], _Source[FieldIndex(low + int3(1, 1, 1))], share.x);
+    return lerp(lerp(x00, x10, share.y), lerp(x01, x11, share.y), share.z);
+}
+
+// EdgeShare at a world position.
+float EdgeShareAt(float3 position, float field)
+{
+    if (_EdgeFocus == 0.0) return 1.0;
+    float3 grid = clamp((position - _Origin) / _CellSize, 0.0, float3(_Size - 1));
+    float exposed = saturate((_Blurred[FieldIndex(int3(grid + 0.5))] - field) / _EdgeRange);
+    return _EdgeFocus > 0.0 ? lerp(1.0, exposed, _EdgeFocus) : 1.0 + _EdgeFocus * exposed;
+}
+
+[numthreads(4, 4, 4)]
+void BaseShape(uint3 id : SV_DispatchThreadID)
+{
+    id.z += _SliceStart;
+    if (any(id >= uint3(_Size))) return;
+    float3 position = SamplePosition(id);
+    float rock = 1e9;
+    for (int block = 0; block < _BlockCount; block++)
+    {
+        float inside = -1e9;
+        for (int plane = 0; plane < _PlanesPerBlock; plane++)
+        {
+            float4 values = _Planes[block * _PlanesPerBlock + plane];
+            inside = max(inside, dot(values.xyz, position) - values.w);
+        }
+        rock = min(rock, inside);
+    }
+    _Field[FieldIndex(id)] = rock;
+}
+
+// A large flat face on the base: the intersection of the rock and a half space.
+[numthreads(4, 4, 4)]
+void SlicePass(uint3 id : SV_DispatchThreadID)
+{
+    id.z += _SliceStart;
+    if (any(id >= uint3(_Size))) return;
+    int index = FieldIndex(id);
+    _Field[index] = max(_Source[index], dot(_Slice.xyz, SamplePosition(id)) - _Slice.w);
+}
+
+// Moves the surface out by a height that falls smoothly to 0 at the reach, so a flat face bows without a crease.
+[numthreads(4, 4, 4)]
+void BulgePass(uint3 id : SV_DispatchThreadID)
+{
+    id.z += _SliceStart;
+    if (any(id >= uint3(_Size))) return;
+    int index = FieldIndex(id);
+    float3 offset = (SamplePosition(id) - _BulgeCenter.xyz) / _BulgeReach;
+    if (_BulgeFlat > 0.0)
+    {
+        // A flat plate with straight sides. The product of the slopes has no diagonal crease at a corner, as a box distance has.
+        float3 slope = saturate((1.0 - abs(offset)) / _BulgeFlat);
+        _Field[index] = _Source[index] - _BulgeCenter.w * slope.x * slope.y * slope.z;
+        return;
+    }
+    float share = saturate(1.0 - dot(offset, offset));
+    _Field[index] = _Source[index] - _BulgeCenter.w * share * share;
+}
+
+[numthreads(4, 4, 4)]
+void NoisePass(uint3 id : SV_DispatchThreadID)
+{
+    id.z += _SliceStart;
+    if (any(id >= uint3(_Size))) return;
+    int index = FieldIndex(id);
+    float field = _Source[index];
+    float detailScale = 1.0;
+    if (_PatchContrast > 0.0)
+    {
+        // Two layers of broad noise, with a soft step, so a patch has a clear but not a sharp border.
+        float3 location = SamplePosition(id) * _PatchFrequency;
+        float value = GradientNoise(location, _Seed + 977) + 0.5 * GradientNoise(location * 2.1 + 5.3, _Seed + 1999);
+        // At full contrast, smooth patches keep 15 % of the small layers and rough patches get 150 %. Twice the small layers
+        // made melted lumps and loose bits.
+        float rough = smoothstep(-0.2, 0.2, value);
+        detailScale = 1.0 + _PatchContrast * lerp(-0.85, 0.5, rough);
+    }
+    float noise = LayeredNoise(Warp(SamplePosition(id)) * _NoiseScale, detailScale);
+    // A clipped noise is flat with sharp steps, so stretched noise gives strata with crisp ledges and not soft waves.
+    if (_ClipWidth > 0.0) noise = smoothstep(_ClipLevel - _ClipWidth, _ClipLevel + _ClipWidth, noise);
+    // A sum of a field and noise is not a distance, but a carve can only remove rock, so it cannot add loose parts.
+    if (_CarveOnly != 0) noise = max(noise, 0.0);
+    float masked = _UseEdgeMask != 0 ? _EdgeMask[index] : 1.0;
+    _Field[index] = field + _Amount * EdgeShare(index, field) * noise * masked;
+}
+
+// Joint k of a set lies near k, in spacing units, and moves at random. The jitter stays below 0.8, so joints keep order.
+float JointAt(int joint, int3 salt)
+{
+    return joint + (Chance(int3(joint, salt.x, salt.y) + _Seed + salt.z).x - 0.5) * _SpacingJitter;
+}
+
+// Finds the two joints around a coordinate in spacing units.
+int FindSpan(float coordinate, int3 salt)
+{
+    int cell = int(floor(coordinate));
+    if (coordinate < JointAt(cell, salt)) return cell - 1;
+    if (coordinate >= JointAt(cell + 1, salt)) return cell + 1;
+    return cell;
+}
+
+// Field of one block. The block is a rounded box between its joints, with a small turn and a move of its faces. The
+// block exists where the earlier field at its center is rock, so the surface steps along the joints like a real face
+// where blocks fell out. With _Follow 1, the block follows the earlier surface instead.
+float BlockField(float3 frame, float3 center, float3 halfSize, int3 id, float field, float gapShare, float rowSize)
+{
+    float3 chance = Chance(id + _Seed + 61);
+    if (chance.x < _Missing) return 1e9;
+    float3 spin = (Chance(id.zxy + _Seed + 7919) - 0.5) * 2.0 * _Tilt;
+
+    float3 local = frame - center;
+    local += cross(spin, local);
+    float3 faces;
+    if (_FaceTilt > 0.0)
+    {
+        // Each of the six faces is a plane with its own slope.
+        float3 slopeX = (Chance(id + _Seed + 401) - 0.5) * 2.0 * _FaceTilt;
+        float3 slopeY = (Chance(id + _Seed + 409) - 0.5) * 2.0 * _FaceTilt;
+        float3 slopeZ = (Chance(id + _Seed + 419) - 0.5) * 2.0 * _FaceTilt;
+        float3 upper = local + float3(dot(local.yz, slopeX.xy), dot(local.xz, slopeY.xy), dot(local.xy, slopeZ.xy));
+        float3 lower = -local + float3(dot(local.yz, slopeX.yz), dot(local.xz, slopeY.yz), dot(local.xy, slopeZ.yz));
+        faces = max(upper, lower);
+    }
+    else
+    {
+        faces = abs(local);
+    }
+    float3 inner = faces - halfSize + 0.5 * _Gap * gapShare;
+    float radius = _Rounding * gapShare;
+    float3 rounded = inner + radius;
+    float box = length(max(rounded, 0.0)) + min(max(rounded.x, max(rounded.y, rounded.z)), 0.0) - radius;
+    // Blocks deep in the rock get no relief: smaller blocks there leave air between them, and the rock is a loose stack that
+    // later passes break open. One share for the whole block keeps its faces flat. A share of each sample bows them. A small
+    // overlap closes the gaps of the turned blocks.
+    float3 scaledCenter = center;
+    scaledCenter.xz /= rowSize;
+    float centerField = SampleSource(mul(transpose((float3x3)_Frame), scaledCenter));
+    box -= (chance.y - 0.5) * 2.0 * _Relief * saturate((centerField + 2.0 * _Core) / max(_Core, 1e-4));
+    box -= saturate(1.0 - 2.0 * gapShare) * _Overlap;
+
+    // A row of another size reads the field at a point nearer to or farther from the axis of the rock. This is a local
+    // transform of the row, so its edges stay sharp.
+    float hereField = field;
+    if (_RowScale > 0.0 && _Follow > 0.0)
+    {
+        float3 scaledHere = frame;
+        scaledHere.xz /= rowSize;
+        hereField = SampleSource(mul(transpose((float3x3)_Frame), scaledHere));
+    }
+    float jitter = (chance.z - 0.5) * 2.0 * _KeepJitter;
+    if (all(_Spacing > 0.0))
+    {
+        // A whole block stays or goes. A value of the earlier field in the block would put all its rock just below the
+        // surface, and its sign there would be noise. The kept block is its own distance, and the earlier surface cuts
+        // it only as far as Follow asks.
+        if (_Follow < 1.0 && centerField + jitter > _KeepMargin) return 1e9;
+        return max(box, hereField - (1.0 - _Follow) * length(halfSize) + _Follow * jitter);
+    }
+    // A set that is off gives rows or columns with no end, so the level changes along them. It is a distance there.
+    float level = lerp(centerField, hereField, _Follow) + jitter;
+    return max(box, lerp(level, box, saturate(-level / (4.0 * _CellSize))));
+}
+
+[numthreads(4, 4, 4)]
+void JointPass(uint3 id : SV_DispatchThreadID)
+{
+    id.z += _SliceStart;
+    if (any(id >= uint3(_Size))) return;
+    int index = FieldIndex(id);
+    float field = _Source[index];
+    // Deep rock stays solid, so joints make no inner surfaces. Far from the rock no block can reach.
+    if (field < -_Solid - 2.0 * _CellSize || field > _Reach)
+    {
+        _Field[index] = field > 0.0 ? field : field + _Solid;
+        return;
+    }
+
+    float3 position = SamplePosition(id);
+    float3 frame = mul((float3x3)_Frame, Warp(position));
+    bool3 hasSet = _Spacing > 0.0;
+    float3 spacing = max(_Spacing, 1e-4);
+
+    // A joint opens fully at the surface and closes at the core depth. The noise closes some parts of a joint.
+    float gapShare = saturate((field + _Core) / max(_Core, 1e-4));
+    float closed = 0.0;
+    if (_Persistence < 1.0)
+    {
+        float meanSpacing = dot(spacing, float3(hasSet)) / max(dot(float3(hasSet), 1.0), 1.0);
+        float open = 0.5 + 1.4 * GradientNoise(position / (2.0 * meanSpacing), _Seed + 1301);
+        float limit = 1.0 - _Persistence;
+        float share = smoothstep(limit - 0.12, limit + 0.12, open);
+        gapShare *= share;
+        closed = 1.0 - share;
+    }
+    float blendWidth = max(_Blend * closed, 1e-4);
+
+    float best = 1e9;
+    float bestTag = 0.0;
+    int rowStart = hasSet.y ? FindSpan(frame.y / spacing.y, int3(0, 0, 11)) : 0;
+    int rowReach = hasSet.y ? 1 : 0;
+    [loop]
+    for (int rowStep = -rowReach; rowStep <= rowReach; rowStep++)
+    {
+        int row = rowStart + rowStep;
+        float lowY = hasSet.y ? JointAt(row, int3(0, 0, 11)) : 0.0;
+        float highY = hasSet.y ? JointAt(row + 1, int3(0, 0, 11)) : 0.0;
+        float centerY = hasSet.y ? 0.5 * (lowY + highY) * spacing.y : frame.y;
+        float halfY = hasSet.y ? 0.5 * (highY - lowY) * spacing.y : 1e6;
+        float rowSize = 1.0 + (Chance(int3(row, 17, 29) + _Seed).x - 0.5) * 2.0 * _RowScale;
+
+        // With a row shift, the next set starts again in each row and its joints end at the row joints.
+        int rowSalt = _RowShift > 0.0 ? row : 0;
+        float shiftX = (Chance(int3(row, 3, 5) + _Seed).x - 0.5) * _RowShift;
+        float locationX = frame.x / spacing.x + shiftX;
+        int columnStart = hasSet.x ? FindSpan(locationX, int3(rowSalt, 0, 23)) : 0;
+        int columnReach = hasSet.x ? 1 : 0;
+        [loop]
+        for (int columnStep = -columnReach; columnStep <= columnReach; columnStep++)
+        {
+            int column = columnStart + columnStep;
+            float lowX = hasSet.x ? JointAt(column, int3(rowSalt, 0, 23)) : 0.0;
+            float highX = hasSet.x ? JointAt(column + 1, int3(rowSalt, 0, 23)) : 0.0;
+            float centerX = hasSet.x ? (0.5 * (lowX + highX) - shiftX) * spacing.x : frame.x;
+            float halfX = hasSet.x ? 0.5 * (highX - lowX) * spacing.x : 1e6;
+
+            int columnSalt = _RowShift > 0.0 ? column : 0;
+            float shiftZ = (Chance(int3(rowSalt, columnSalt, 7) + _Seed).x - 0.5) * _RowShift;
+            float locationZ = frame.z / spacing.z + shiftZ;
+            int depthStart = hasSet.z ? FindSpan(locationZ, int3(rowSalt, columnSalt, 37)) : 0;
+            int depthReach = hasSet.z ? 1 : 0;
+            [loop]
+            for (int depthStep = -depthReach; depthStep <= depthReach; depthStep++)
+            {
+                int depth = depthStart + depthStep;
+                float lowZ = hasSet.z ? JointAt(depth, int3(rowSalt, columnSalt, 37)) : 0.0;
+                float highZ = hasSet.z ? JointAt(depth + 1, int3(rowSalt, columnSalt, 37)) : 0.0;
+                float centerZ = hasSet.z ? (0.5 * (lowZ + highZ) - shiftZ) * spacing.z : frame.z;
+                float halfZ = hasSet.z ? 0.5 * (highZ - lowZ) * spacing.z : 1e6;
+
+                float3 center = float3(centerX, centerY, centerZ);
+                float3 halfSize = float3(halfX, halfY, halfZ);
+                int3 block = int3(row, column, depth);
+                float value = BlockField(frame, center, halfSize, block, field, gapShare, rowSize);
+                if (value < best) bestTag = Chance(block + _Seed + 131).x;
+                // Smooth minimum (Quilez). Where a joint is closed, the two blocks fuse. An open joint stays sharp.
+                float blendShare = max(blendWidth - abs(best - value), 0.0) / blendWidth;
+                best = min(best, value) - blendShare * blendShare * blendWidth * 0.25;
+            }
+        }
+    }
+    _Field[index] = min(best, field + _Solid);
+    if (_WriteTags != 0) _Tags[index] = bestTag;
+}
+
+// Worley distance to the nearest cell border (Quilez, voronoi borders). The first search finds the nearest point. The
+// second search finds the nearest bisector plane, which is the true distance to the border.
+void CellSearch(float3 position, out float border, out float3 nearest, out int3 nearestCell, out float3 beside,
+    out int3 besideCell)
+{
+    beside = 0.0;
+    besideCell = int3(floor(position));
+    int3 cell = int3(floor(position));
+    float3 offset = position - floor(position);
+    float closest = 1e9;
+    nearest = 0.0;
+    int3 nearestMove = 0;
+    [loop]
+    for (int z = -1; z <= 1; z++)
+    {
+        [loop]
+        for (int y = -1; y <= 1; y++)
+        {
+            [loop]
+            for (int x = -1; x <= 1; x++)
+            {
+                int3 move = int3(x, y, z);
+                float3 delta = float3(move) + Chance(cell + move + _Seed) * _CellJitter - offset;
+                float separation = dot(delta, delta);
+                if (separation < closest)
+                {
+                    closest = separation;
+                    nearest = delta;
+                    nearestMove = move;
+                }
+            }
+        }
+    }
+
+    nearestCell = cell + nearestMove;
+    border = 1e9;
+    [loop]
+    for (int wideZ = -2; wideZ <= 2; wideZ++)
+    {
+        [loop]
+        for (int wideY = -2; wideY <= 2; wideY++)
+        {
+            [loop]
+            for (int wideX = -2; wideX <= 2; wideX++)
+            {
+                int3 move = nearestMove + int3(wideX, wideY, wideZ);
+                float3 delta = float3(move) + Chance(cell + move + _Seed) * _CellJitter - offset;
+                float3 between = delta - nearest;
+                float separation = dot(between, between);
+                if (separation < 1e-5) continue;
+                float toBorder = dot(0.5 * (nearest + delta), between / sqrt(separation));
+                if (toBorder < border)
+                {
+                    border = toBorder;
+                    beside = delta;
+                    besideCell = cell + move;
+                }
+            }
+        }
+    }
+}
+
+// Direction of the source field at a world position.
+float3 SourceNormal(float3 position)
+{
+    float reach = 2.0 * _CellSize;
+    float3 gradient = float3(
+        SampleSource(position + float3(reach, 0.0, 0.0)) - SampleSource(position - float3(reach, 0.0, 0.0)),
+        SampleSource(position + float3(0.0, reach, 0.0)) - SampleSource(position - float3(0.0, reach, 0.0)),
+        SampleSource(position + float3(0.0, 0.0, reach)) - SampleSource(position - float3(0.0, 0.0, reach)));
+    return gradient / max(length(gradient), 1e-5);
+}
+
+[numthreads(4, 4, 4)]
+void CellPass(uint3 id : SV_DispatchThreadID)
+{
+    id.z += _SliceStart;
+    if (any(id >= uint3(_Size))) return;
+    int index = FieldIndex(id);
+    float field = _Source[index];
+    if (abs(field) > _Reach)
+    {
+        _Field[index] = field;
+        return;
+    }
+
+    float3 location = Warp(SamplePosition(id)) * _CellScale;
+    float border;
+    float3 nearest;
+    int3 nearestCell;
+    float3 beside;
+    int3 besideCell;
+    CellSearch(location, border, nearest, nearestCell, beside, besideCell);
+
+    // Round shoulders fall into a thin crack. Each cell also moves and turns as one piece, so plates overlap.
+    float crack = 1.0 - pow(saturate(border / _CrackWidth), _CrackProfile);
+    float3 chance = Chance(nearestCell + _Seed + 97);
+    float3 slope = (Chance(nearestCell.yzx + _Seed + 211) - 0.5) * 2.0;
+    float height = (chance.x - 0.5) * 2.0 * _CellOffset + dot(-nearest / _CellScale, slope) * _Facet;
+    height -= crack * _CrackDepth;
+    if (_Horizontal > 0.0)
+    {
+        // Tops and undersides stay flat. Only the sides of the rock move.
+        float3 normal = SourceNormal(SamplePosition(id));
+        height *= lerp(1.0, sqrt(saturate(1.0 - normal.y * normal.y)), _Horizontal);
+    }
+    _Field[index] = field - height * EdgeShare(index, field);
+}
+
+// The field of one cell after its cut. The cell point is given as an offset from the warped sample, in cell units.
+float PlaneField(float3 position, float3 warped, float3 offset, int3 cell, float field)
+{
+    float3 chance = Chance(cell + _Seed + 97);
+    if (chance.y >= _CutShare) return field;
+    // The cell point lies in warped space, and the plane must lie in real space. One step of the inverse warp is enough
+    // for a slow warp. Without it, a large warp moves each plane by the size of the warp.
+    float3 warpedAnchor = warped + offset / _CellScale;
+    float3 anchor = warpedAnchor - (Warp(warpedAnchor) - warpedAnchor);
+    float3 normal = SourceNormal(anchor);
+    float3 onSurface = anchor - normal * SampleSource(anchor);
+    float3 slope = (Chance(cell.yzx + _Seed + 211) - 0.5) * 2.0;
+    float3 planeNormal = normalize(normal + slope * _Facet);
+    float depthShare = pow(chance.x, _CutDepthPower);
+    if (_CutLevels > 0) depthShare = ceil(depthShare * _CutLevels) / _CutLevels;
+    float plane = dot(position - onSurface, planeNormal) + depthShare * _CutDepth;
+    // One limit for the whole cell: a limit that changes at each sample bends the plane into a lump.
+    float limit = _CutLimit * EdgeShareAt(onSurface, SampleSource(onSurface));
+    return max(field, min(plane, field + limit));
+}
+
+// Removes rock with one flat plane in each cell, and never adds rock. The plane starts on the surface at the point of the
+// cell, turns at random and lies a random depth in the rock. The result is the rock cut by a low detail copy of itself
+// with flat faces: blocks keep their shape and get flat chips and facets with sharp edges. A displacement here rounds them.
+[numthreads(4, 4, 4)]
+void CutPass(uint3 id : SV_DispatchThreadID)
+{
+    id.z += _SliceStart;
+    if (any(id >= uint3(_Size))) return;
+    int index = FieldIndex(id);
+    float field = _Source[index];
+    if (abs(field) > _Reach)
+    {
+        _Field[index] = field;
+        return;
+    }
+
+    float3 position = SamplePosition(id);
+    float3 warped = Warp(position);
+    float border;
+    float3 nearest;
+    int3 nearestCell;
+    float3 beside;
+    int3 besideCell;
+    CellSearch(warped * _CellScale, border, nearest, nearestCell, beside, besideCell);
+
+    // Each cell is a solid: the rock in the cell, cut by its plane. The border is a true distance, so the union of the two
+    // nearest cells has an exact, sharp wall between their depths. A plain change of depth at the border has no surface for
+    // the mesher to follow and makes stairs along the grid.
+    float toBorder = border * _DistanceScale;
+    float own = PlaneField(position, warped, nearest, nearestCell, field);
+    float other = PlaneField(position, warped, beside, besideCell, field);
+    float carved = max(field, min(max(-toBorder, own), max(toBorder, other)));
+    if (_WriteEdgeMask != 0) _EdgeMaskOut[index] = 1.0 - saturate(border / _EdgeMaskWidth);
+    float crack = 1.0 - pow(saturate(border / _CrackWidth), _CrackProfile);
+    if (_Sparsity > 0.0)
+    {
+        // Only the peaks of a noise along the cell space keep a crack, so solid rock stays between the cracks.
+        float peaks = 0.5 + 1.4 * GradientNoise(warped * _CellScale * 0.35, _Seed + 1409);
+        crack *= smoothstep(_Sparsity - 0.05, _Sparsity + 0.05, peaks);
+    }
+    // Cracks stay on the outer rock and never pass through the core.
+    float outer = _MaxCarve > 0.0 ? smoothstep(-_MaxCarve, -0.5 * _MaxCarve, _Base[index]) : 1.0;
+    _Field[index] = carved + crack * _CrackDepth * outer * EdgeShare(index, field);
+}
+
+// Height tile of DisplacePass, with a mean of 0 and a deviation of 1.
+Texture2D<float> _DisplaceMap;
+SamplerState sampler_linear_repeat;
+float _DisplaceAmount;
+float _DisplaceScale;
+float _DisplaceMip;
+float _DisplaceSharpness;
+float3 _DisplaceOffset;
+// 1 = each base block reads its own part of the tile, so a cut stops at the border of its block.
+int _DisplaceByBlock;
+
+// The base block that holds a position: the block with the position deepest inside it.
+int HomeBlock(float3 position)
+{
+    int home = 0;
+    float best = 1e9;
+    for (int block = 0; block < _BlockCount; block++)
+    {
+        float inside = -1e9;
+        for (int plane = 0; plane < _PlanesPerBlock; plane++)
+        {
+            float4 values = _Planes[block * _PlanesPerBlock + plane];
+            inside = max(inside, dot(values.xyz, position) - values.w);
+        }
+        if (inside < best)
+        {
+            best = inside;
+            home = block;
+        }
+    }
+    return home;
+}
+
+// Moves the surface by a height tile, projected from the three axes. The tile has no UV seams, because it uses the position.
+[numthreads(4, 4, 4)]
+void DisplacePass(uint3 id : SV_DispatchThreadID)
+{
+    id.z += _SliceStart;
+    if (any(id >= uint3(_Size))) return;
+    int index = FieldIndex(id);
+    float field = _Source[index];
+    if (abs(field) > _Reach)
+    {
+        _Field[index] = field;
+        return;
+    }
+
+    int3 cell = int3(id);
+    int3 high = min(cell + 1, _Size - 1);
+    int3 low = max(cell - 1, 0);
+    float3 normal = float3(_Source[FieldIndex(int3(high.x, cell.y, cell.z))] - _Source[FieldIndex(int3(low.x, cell.y, cell.z))],
+        _Source[FieldIndex(int3(cell.x, high.y, cell.z))] - _Source[FieldIndex(int3(cell.x, low.y, cell.z))],
+        _Source[FieldIndex(int3(cell.x, cell.y, high.z))] - _Source[FieldIndex(int3(cell.x, cell.y, low.z))]);
+    float3 weight = pow(abs(normal) + 1e-5, _DisplaceSharpness);
+    weight /= weight.x + weight.y + weight.z;
+
+    float3 offset = _DisplaceOffset;
+    if (_DisplaceByBlock != 0) offset += float3(5.37, 3.91, 7.13) * float(HomeBlock(SamplePosition(id)) + 1);
+    float3 position = (SamplePosition(id) + offset) * _DisplaceScale;
+    float height = weight.x * _DisplaceMap.SampleLevel(sampler_linear_repeat, position.yz, _DisplaceMip) +
+        weight.y * _DisplaceMap.SampleLevel(sampler_linear_repeat, position.zx, _DisplaceMip) +
+        weight.z * _DisplaceMap.SampleLevel(sampler_linear_repeat, position.xy, _DisplaceMip);
+    _Field[index] = field - _DisplaceAmount * height;
+}
+
+// Relief of the four upright faces of a box, in meters. FaceDisplacePass moves the surface only near the surface, so one face
+// cannot cut through the rock into another face.
+Texture2D<float> _FaceFront;
+Texture2D<float> _FaceBack;
+Texture2D<float> _FaceLeft;
+Texture2D<float> _FaceRight;
+SamplerState sampler_linear_clamp;
+float3 _FaceCenter;
+float3 _FaceHalf;
+
+[numthreads(4, 4, 4)]
+void FaceDisplacePass(uint3 id : SV_DispatchThreadID)
+{
+    id.z += _SliceStart;
+    if (any(id >= uint3(_Size))) return;
+    int index = FieldIndex(id);
+    float field = _Source[index];
+    if (abs(field) > _Reach)
+    {
+        _Field[index] = field;
+        return;
+    }
+
+    int3 cell = int3(id);
+    int3 high = min(cell + 1, _Size - 1);
+    int3 low = max(cell - 1, 0);
+    float3 normal = float3(_Source[FieldIndex(int3(high.x, cell.y, cell.z))] - _Source[FieldIndex(int3(low.x, cell.y, cell.z))],
+        _Source[FieldIndex(int3(cell.x, high.y, cell.z))] - _Source[FieldIndex(int3(cell.x, low.y, cell.z))],
+        _Source[FieldIndex(int3(cell.x, cell.y, high.z))] - _Source[FieldIndex(int3(cell.x, cell.y, low.z))]);
+    // Unit length, so a high sharpness cannot reach zero in all three axes.
+    float3 weight = pow(abs(normal) / max(length(normal), 1e-6) + 1e-5, _DisplaceSharpness);
+    weight /= weight.x + weight.y + weight.z;
+
+    float3 share = (SamplePosition(id) - _FaceCenter + _FaceHalf) / (2.0 * _FaceHalf);
+    // Columns run along the first axis after the face axis, and rows along the second.
+    float2 onZ = share.xy;
+    float2 onX = share.yz;
+    float faceZ = normal.z > 0.0 ? _FaceFront.SampleLevel(sampler_linear_clamp, onZ, 0) : _FaceBack.SampleLevel(sampler_linear_clamp, onZ, 0);
+    float faceX = normal.x < 0.0 ? _FaceLeft.SampleLevel(sampler_linear_clamp, onX, 0) : _FaceRight.SampleLevel(sampler_linear_clamp, onX, 0);
+    _Field[index] = field - weight.z * faceZ - weight.x * faceX;
+}
+
+// Limits of the walk in SplitPass.
+#define SPLIT_STACK 24
+#define SPLIT_VISITS 96
+
+// The field of one block of the split: the rock moved back by the depth of the block, with a small tilt.
+float SplitLeafField(int leaf, float3 position, float field)
+{
+    SplitLeaf block = _SplitLeaves[leaf];
+    return max(field, field + block.depth + dot(position - block.center, block.slope));
+}
+
+// Removes rock in blocks that come from a sequence of splits. Each split stops at the walls of the block that it divides, so
+// a young crack ends at an older crack in a T junction, as real joints do. Voronoi cells meet in Y junctions and read as
+// diagonal polygons. The walls between two blocks are exact, as in CutPass.
+[numthreads(4, 4, 4)]
+void SplitPass(uint3 id : SV_DispatchThreadID)
+{
+    id.z += _SliceStart;
+    if (any(id >= uint3(_Size))) return;
+    int index = FieldIndex(id);
+    float field = _Source[index];
+    if (abs(field) > _Reach)
+    {
+        _Field[index] = field;
+        return;
+    }
+
+    float3 position = SamplePosition(id);
+    float3 warped = Warp(position);
+    // The rock is the union of all blocks, and each block is its cell cut by its own depth. Three blocks meet at a T junction,
+    // so two blocks are not enough: the choice of the second block jumps there and leaves thin sheets of rock. This walk visits
+    // every cell within reach. The value "outside" is the distance past the walls of the cell, and it is negative in the cell.
+    int children[SPLIT_STACK];
+    float outsides[SPLIT_STACK];
+    int top = 1;
+    children[0] = 0;
+    outsides[0] = -1e9;
+    float carvedUnion = 1e9;
+    float toWall = 1e9;
+    [loop]
+    for (int visit = 0; visit < SPLIT_VISITS && top > 0; visit++)
+    {
+        top--;
+        int child = children[top];
+        float outside = outsides[top];
+        if (child < 0)
+        {
+            carvedUnion = min(carvedUnion, max(outside, SplitLeafField(~child, position, field)));
+            if (outside < 0.0) toWall = -outside;
+            continue;
+        }
+        SplitNode node = _SplitNodes[child];
+        float side = dot(warped, node.normal) - node.offset;
+        if (-side < _Reach && top < SPLIT_STACK)
+        {
+            children[top] = node.high;
+            outsides[top] = max(outside, -side);
+            top++;
+        }
+        if (side < _Reach && top < SPLIT_STACK)
+        {
+            children[top] = node.low;
+            outsides[top] = max(outside, side);
+            top++;
+        }
+    }
+    float carved = max(field, carvedUnion);
+    float crack = 1.0 - saturate(toWall / max(_CrackWidth, 1e-4));
+    float outer = _MaxCarve > 0.0 ? smoothstep(-_MaxCarve, -0.5 * _MaxCarve, _Base[index]) : 1.0;
+    _Field[index] = carved + crack * _CrackDepth * outer * EdgeShare(index, field);
+}
+
+float CarveBox(float3 offset, float3 reach)
+{
+    float3 distances = abs(offset) - reach;
+    return length(max(distances, 0.0)) + min(max(distances.x, max(distances.y, distances.z)), 0.0);
+}
+
+// Distance to the nearest turned box of the eight grid corners around a location. The location is in stretched space.
+float CarveBoxes(float3 location)
+{
+    float3 low = floor(location);
+    int3 cell = int3(low);
+    float3 offset = location - low;
+    float best = 1e9;
+    [loop]
+    for (int corner = 0; corner < 8; corner++)
+    {
+        int3 move = int3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1);
+        int3 site = cell + move;
+        float3 chance = Chance(site + _Seed + 151);
+        if (chance.x > _CutShare) continue;
+        float3 center = float3(move) + (Chance(site.yzx + _Seed + 163) - 0.5) * 0.5;
+        if (_UseEdgeMask != 0)
+        {
+            // Boxes come only near the cell borders of the main cut. One choice for each box keeps its faces flat.
+            float3 place = mul(transpose((float3x3)_Frame), (float3(cell) + center) / _CellScale);
+            int3 sampleCell = clamp(int3((place - _Origin) / _CellSize + 0.5), 0, _Size - 1);
+            if (chance.y > _EdgeMask[FieldIndex(sampleCell)]) continue;
+        }
+        if (_EdgeFocus != 0.0)
+        {
+            // One choice for each box: a share that changes at each sample bends the box.
+            float3 world = mul(transpose((float3x3)_Frame), (float3(cell) + center) / _CellScale);
+            if (chance.y > EdgeShareAt(world, SampleSource(world))) continue;
+        }
+        float3 reach = lerp(0.12, 0.42, Chance(site.zxy + _Seed + 173));
+        float3 axis = normalize(Chance(site + _Seed + 181) - 0.5 + 1e-4);
+        float angle = chance.z * 3.14159;
+        float3 local = offset - center;
+        // Rodrigues rotation of the sample into the frame of the box.
+        local = local * cos(angle) + cross(axis, local) * sin(angle) + axis * dot(axis, local) * (1.0 - cos(angle));
+        best = min(best, CarveBox(local, reach));
+    }
+    return best;
+}
+
+// Carves fractal detail from a solid (Quilez, FBM detail in SDFs, the subtractive form) with boxes, not spheres, so the
+// chips have flat faces and sharp edges at each size. Holes stay in a shell below the surface, so the rock stays solid.
+// The minimum and maximum of distances stay close to a distance. Noise added to a field does not.
+[numthreads(4, 4, 4)]
+void CarvePass(uint3 id : SV_DispatchThreadID)
+{
+    id.z += _SliceStart;
+    if (any(id >= uint3(_Size))) return;
+    int index = FieldIndex(id);
+    float field = _Source[index];
+    if (field > _Reach || field < -_CutDepth - _Reach)
+    {
+        _Field[index] = field;
+        return;
+    }
+    float3 location = mul((float3x3)_Frame, Warp(SamplePosition(id))) * _CellScale;
+    float hole = max(CarveBoxes(location) * _DistanceScale, -(field + _CutDepth));
+    _Field[index] = max(field, -hole);
+}
+
+// The opening rounds each convex edge by a small amount, and it removes a thin part by a large amount. Only the large
+// changes stay, so the block edges stay sharp.
+[numthreads(4, 4, 4)]
+void OpenFinish(uint3 id : SV_DispatchThreadID)
+{
+    id.z += _SliceStart;
+    if (any(id >= uint3(_Size))) return;
+    int index = FieldIndex(id);
+    float opened = _Source[index];
+    float original = _Blurred[index];
+    _Field[index] = opened - original > _Amount ? opened : original;
+}
+
+[numthreads(4, 4, 4)]
+void ClampCarve(uint3 id : SV_DispatchThreadID)
+{
+    id.z += _SliceStart;
+    if (any(id >= uint3(_Size))) return;
+    int index = FieldIndex(id);
+    _Field[index] = min(_Source[index], _Base[index] + _MaxCarve);
+}
+
+// Each disc is a step and a crack. The rock on the negative side of the plane moves back, and the plane is the exact wall
+// of the step, so a ledge has a sharp lip. Step and crack both taper to nothing at the rim of the disc.
+[numthreads(4, 4, 4)]
+void FracturePass(uint3 id : SV_DispatchThreadID)
+{
+    id.z += _SliceStart;
+    if (any(id >= uint3(_Size))) return;
+    int index = FieldIndex(id);
+    float field = _Source[index];
+    if (field > _Reach || field < -_MaxCarve - _Reach)
+    {
+        _Field[index] = field;
+        return;
+    }
+
+    float3 position = Warp(SamplePosition(id));
+    float result = field;
+    float damage = 0.0;
+    // A crack shows as a line where its plane meets the surface steeply. Where the plane runs nearly along the surface, the
+    // crack would carve a broad hollow, so it fades out there.
+    float3 surfaceNormal = SourceNormal(SamplePosition(id));
+    [loop]
+    for (int item = 0; item < _FractureCount; item++)
+    {
+        Fracture fracture = _Fractures[item];
+        float3 offset = position - fracture.center;
+        float toPlane = dot(offset, fracture.normal);
+        float across = dot(offset, fracture.along);
+        float inward = dot(offset, cross(fracture.normal, fracture.along)) / fracture.halfWidth;
+        // A connected fracture keeps its full step up to the fracture that stops it, and fades over a short end only.
+        float lengthShare = fracture.endFade > 0.0 ? saturate((fracture.halfLength - abs(across)) / fracture.endFade)
+            : saturate(1.0 - across * across / (fracture.halfLength * fracture.halfLength));
+        // Runs of a bent fracture stop at a plane square to one axis. Ends square to each run open a wedge at each kink.
+        if (fracture.endReach > 0.0)
+        {
+            float toHead = dot(offset, fracture.endAxis) + fracture.endReach;
+            float toTail = 2.0 * fracture.endReach - toHead;
+            float head = fracture.headFade > 0.0 ? saturate(toHead / fracture.headFade) : toHead >= 0.0 ? 1.0 : 0.0;
+            float tail = fracture.tailFade > 0.0 ? saturate(toTail / fracture.tailFade) : toTail > 0.0 ? 1.0 : 0.0;
+            lengthShare = head * tail;
+        }
+        float taper = lengthShare * saturate(1.0 - inward * inward);
+        if (taper <= 0.0) continue;
+        // The step keeps most of its depth along the disc and falls fast at the rim. The crack narrows to a point.
+        float shape = smoothstep(0.0, 0.45, taper);
+        // The step is deepest under the lip and fades with the distance from the plane, so the rock below is a tilted face
+        // and not a slit. A row of these gives the sawtooth profile of bedded rock, and each face catches its own light.
+        float fade = saturate(1.0 + toPlane / fracture.stepFade);
+        // The depth changes along the ledge, so a long step does not read as one straight slit.
+        float wanderAt = fracture.endReach > 0.0 ? dot(position, fracture.endAxis) : across;
+        float row = fracture.endReach > 0.0 ? fracture.row : float(item);
+        float wander = GradientNoise(float3(wanderAt * _StepBreakupRate, row * 3.7, 0.5), _Seed + 1553) +
+            0.5 * GradientNoise(float3(wanderAt * _StepBreakupRate * 2.7, row * 5.1, 2.5), _Seed + 1559);
+        float stepHere = fracture.stepDepth * max(1.0 + _StepBreakup * 2.0 * wander, 0.1);
+        result = min(result + stepHere * shape * fade, max(result, -toPlane));
+        // A crack narrower than about one and a half cells breaks into a row of dots in the mesh. A crack keeps that width up
+        // to its ends, and the ends fade in depth.
+        float width = fracture.crackDepth > 0.0 ? max(fracture.crackWidth * shape, 1.5 * _CellSize)
+            : fracture.crackWidth * shape + 1e-4;
+        float inCrack = saturate(1.0 - abs(toPlane) / width);
+        float facing = 1.0 - smoothstep(0.55, 0.8, abs(dot(normalize(fracture.normal), surfaceNormal)));
+        result += fracture.crackDepth * shape * inCrack * facing;
+        // Weathering rounds the lips: a shallow channel with a round profile, wider than the crack, follows it.
+        if (_CrackWeathering > 0.0 && fracture.crackDepth > 0.0)
+        {
+            float mouth = width * (1.0 + 3.0 * _CrackWeathering);
+            float bell = saturate(1.0 - toPlane * toPlane / (mouth * mouth));
+            result += 0.6 * _CrackWeathering * mouth * shape * bell * bell * facing;
+        }
+        damage = max(damage, shape * saturate(1.0 - abs(toPlane) / _EdgeMaskWidth));
+    }
+    // Steps add up where discs overlap. The limit keeps the face flush, so stacked steps do not form a shelf.
+    _Field[index] = _StepLimit > 0.0 ? min(result, field + _StepLimit) : result;
+    if (_WriteEdgeMask != 0) _EdgeMaskOut[index] = damage;
+}
+
+// Bytes in the order of the color channels of the texture.
+uint PackBytes(float4 value)
+{
+    uint4 bytes = uint4(saturate(value) * 255.0 + 0.5);
+    return bytes.r | (bytes.g << 8u) | (bytes.b << 16u) | (bytes.a << 24u);
+}
+
+// What a rock shader needs to know about the fractures at each point. R is the signed distance to the nearest fracture: a signed
+// value crosses 0 between two samples, so the shader can draw a thin line from a coarse grid. G is the same distance with no
+// sign. The sign flips halfway between two fractures, and G tells that place from a real fracture. B is the tone of the block.
+// It changes only across a fracture. A is the distance below the nearest ledge. Warp matches FracturePass, so lines lie on the steps.
+[numthreads(4, 4, 4)]
+void FractureVolume(uint3 id : SV_DispatchThreadID)
+{
+    id.z += _SliceStart;
+    if (any(id >= uint3(_Size))) return;
+    float3 position = Warp(SamplePosition(id));
+    float nearest = 1e9;
+    float nearestSigned = 0.0;
+    float tone = 0.0;
+    float below = 1e9;
+    [loop]
+    for (int item = 0; item < _FractureCount; item++)
+    {
+        Fracture fracture = _Fractures[item];
+        float3 offset = position - fracture.center;
+        float toPlane = dot(offset, fracture.normal);
+        float across = dot(offset, fracture.along);
+        float inward = dot(offset, cross(fracture.normal, fracture.along));
+        float pastLength = max(abs(across) - fracture.halfLength, 0.0);
+        float pastWidth = max(abs(inward) - fracture.halfWidth, 0.0);
+        float separation = sqrt(toPlane * toPlane + pastLength * pastLength + pastWidth * pastWidth);
+        if (separation < nearest)
+        {
+            nearest = separation;
+            nearestSigned = toPlane < 0.0 ? -separation : separation;
+        }
+        if (pastLength > 0.0 || pastWidth > 0.0) continue;
+        float share = saturate(1.0 - inward * inward / (fracture.halfWidth * fracture.halfWidth));
+        // Each fracture lifts one side and lowers the other, so each block between fractures has its own sum.
+        float weight = (Chance(int3(item, 7, 13)).x - 0.5) * 2.0;
+        tone += weight * (toPlane < 0.0 ? -share : share);
+        if (fracture.normal.y > 0.5 && toPlane < 0.0) below = min(below, -toPlane / fracture.normal.y);
+    }
+    _VolumeOut[FieldIndex(int3(id))] = PackBytes(float4(0.5 + 0.5 * nearestSigned / _VolumeRange.x, nearest / _VolumeRange.y,
+        0.5 + 0.25 * tone, below / _VolumeRange.w));
+}
+
+[numthreads(4, 4, 4)]
+void BlurPass(uint3 id : SV_DispatchThreadID)
+{
+    id.z += _SliceStart;
+    if (any(id >= uint3(_Size))) return;
+    int index = FieldIndex(id);
+    int3 cell = int3(id);
+    float sum = 0.0;
+    float total = 0.0;
+    [loop]
+    for (int offset = -_BlurRadius; offset <= _BlurRadius; offset++)
+    {
+        float weight = exp(-0.5 * offset * offset / (_BlurSigma * _BlurSigma));
+        sum += weight * _Source[FieldIndex(clamp(cell + _BlurAxis * offset, 0, _Size - 1))];
+        total += weight;
+    }
+    _Field[index] = sum / total;
+}
+
+// The blurred field passes the field at convex edges and stays below it in cavities. Wear takes rock from the edges and
+// keeps the cracks. Fill closes the cavities.
+[numthreads(4, 4, 4)]
+void SmoothPass(uint3 id : SV_DispatchThreadID)
+{
+    id.z += _SliceStart;
+    if (any(id >= uint3(_Size))) return;
+    int index = FieldIndex(id);
+    float field = _Source[index];
+    float change = _Blurred[index] - field;
+    float share = change > 0.0 ? _Wear : _Fill;
+    if (_Patchy > 0.0)
+    {
+        float noise = 0.5 + 1.5 * GradientNoise(SamplePosition(id) * _Frequency, _Seed);
+        share *= lerp(1.0, smoothstep(0.4, 0.6, noise), _Patchy);
+    }
+    _Field[index] = field + change * share;
+}
+
+[numthreads(4, 4, 4)]
+void OffsetPass(uint3 id : SV_DispatchThreadID)
+{
+    id.z += _SliceStart;
+    if (any(id >= uint3(_Size))) return;
+    int index = FieldIndex(id);
+    _Field[index] = _Source[index] + _Amount;
+}
+
+// Passes such as the joints leave a field that is not a distance. The rebuild keeps only the surface, where the sign
+// changes, and finds the nearest surface point of each sample with jump flooding (Rong and Tan 2006). Each sample keeps a
+// point, not a distance, so the result is a Euclidean distance. A sum of grid steps has the pattern of the grid.
+[numthreads(4, 4, 4)]
+void RedistanceSeed(uint3 id : SV_DispatchThreadID)
+{
+    id.z += _SliceStart;
+    if (any(id >= uint3(_Size))) return;
+    int3 cell = int3(id);
+    int index = FieldIndex(cell);
+    float value = _Source[index];
+    // The crossing on each grid edge gives the distance to a plane: 1 / sqrt(sum of 1 / crossing^2).
+    float inverse = 0.0;
+    float3 gradient = 0.0;
+    [loop]
+    for (int axis = 0; axis < 3; axis++)
+    {
+        int3 move = int3(axis == 0, axis == 1, axis == 2);
+        int3 upper = cell + move;
+        int3 lower = cell - move;
+        float above = all(upper < _Size) ? _Source[FieldIndex(upper)] : value;
+        float below = all(lower >= 0) ? _Source[FieldIndex(lower)] : value;
+        gradient += float3(move) * (above - below);
+        float nearest = 1e9;
+        if ((above < 0.0) != (value < 0.0)) nearest = abs(value) / max(abs(value) + abs(above), 1e-6);
+        if ((below < 0.0) != (value < 0.0)) nearest = min(nearest, abs(value) / max(abs(value) + abs(below), 1e-6));
+        if (nearest < 1e8) inverse += 1.0 / max(nearest * nearest, 1e-6);
+    }
+    if (inverse <= 0.0)
+    {
+        _NearestOut[index] = NoPoint;
+        return;
+    }
+    float3 direction = gradient / max(length(gradient), 1e-6);
+    float reach = _CellSize / sqrt(inverse);
+    _NearestOut[index] = SamplePosition(id) - direction * (value < 0.0 ? -reach : reach);
+}
+
+[numthreads(4, 4, 4)]
+void RedistanceSweep(uint3 id : SV_DispatchThreadID)
+{
+    id.z += _SliceStart;
+    if (any(id >= uint3(_Size))) return;
+    int3 cell = int3(id);
+    float3 position = SamplePosition(id);
+    float3 best = _NearestIn[FieldIndex(cell)];
+    float bestDistance = best.x < 1e8 ? dot(best - position, best - position) : 1e18;
+    [loop]
+    for (int z = -1; z <= 1; z++)
+    {
+        [loop]
+        for (int y = -1; y <= 1; y++)
+        {
+            [loop]
+            for (int x = -1; x <= 1; x++)
+            {
+                int3 other = cell + int3(x, y, z) * _JumpLength;
+                if (any(other < 0) || any(other >= _Size)) continue;
+                float3 found = _NearestIn[FieldIndex(other)];
+                if (found.x >= 1e8) continue;
+                float separation = dot(found - position, found - position);
+                if (separation < bestDistance)
+                {
+                    bestDistance = separation;
+                    best = found;
+                }
+            }
+        }
+    }
+    _NearestOut[FieldIndex(cell)] = best;
+}
+
+// True when a sample lies beside the surface: one of its six neighbors has the other sign.
+bool BesideSurface(int3 cell, float value)
+{
+    static const int3 Sides[6] =
+    {
+        int3(1, 0, 0), int3(-1, 0, 0), int3(0, 1, 0), int3(0, -1, 0), int3(0, 0, 1), int3(0, 0, -1)
+    };
+    for (int side = 0; side < 6; side++)
+    {
+        int3 other = cell + Sides[side];
+        if (any(other < 0) || any(other >= _Size)) continue;
+        if ((_Source[FieldIndex(other)] < 0.0) != (value < 0.0)) return true;
+    }
+    return false;
+}
+
+[numthreads(4, 4, 4)]
+void RedistanceFinish(uint3 id : SV_DispatchThreadID)
+{
+    id.z += _SliceStart;
+    if (any(id >= uint3(_Size))) return;
+    int3 cell = int3(id);
+    int index = FieldIndex(cell);
+    float value = _Source[index];
+    // Samples beside the surface keep their value, so the surface and its sharp edges do not move.
+    if (BesideSurface(cell, value))
+    {
+        _Field[index] = value;
+        return;
+    }
+    float3 found = _NearestIn[index];
+    float inside = value < 0.0 ? -1.0 : 1.0;
+    _Field[index] = inside * (found.x < 1e8 ? length(found - SamplePosition(id)) : max(abs(value), 1.0));
+}
+
+// Distance to a crack face. The face bends with the same roughness at all scales (a self-affine surface): each octave has
+// half the size and 2^-0.8 of the height, after the roughness exponent of about 0.8 measured on rock fractures.
+float CrackFaceDistance(CrackNode node, float3 position)
+{
+    float distance = dot(position - node.position, node.normal);
+    if (_CrackRough <= 0.0) return distance;
+    float3 location = position * _CrackRoughFrequency;
+    float height = _CrackRough;
+    for (int octave = 0; octave < 5; octave++)
+    {
+        distance += height * 2.0 * GradientNoise(location, node.seed + octave * 131);
+        location = location * 2.03 + 7.1;
+        height *= 0.574;
+    }
+    return distance;
+}
+
+[numthreads(4, 4, 4)]
+void CrackPass(uint3 id : SV_DispatchThreadID)
+{
+    id.z += _SliceStart;
+    if (any(id >= uint3(_Size))) return;
+    int index = FieldIndex(id);
+    float field = _Source[index];
+    // A crack removes rock near the surface only.
+    if (field > _Reach || field < -_CrackDepth * 2.0 - _Reach)
+    {
+        _Field[index] = field;
+        return;
+    }
+
+    float3 position = SamplePosition(id);
+    float3 surfaceNormal = SourceNormal(position);
+    float sides[32];
+    bool inside[32];
+    float result = field;
+    for (int item = 0; item < _CrackNodeCount; item++)
+    {
+        CrackNode node = _CrackNodes[item];
+        float distance = CrackFaceDistance(node, position);
+        sides[item] = distance;
+        // A crack splits only its own part: the side of each older crack that its parent split off.
+        bool here = node.parent < 0 || (inside[node.parent] && (sides[node.parent] >= 0.0 ? 1 : -1) == node.side);
+        inside[item] = here;
+        if (!here) continue;
+
+        float age = pow(max(_CrackAge, 1e-3), node.generation);
+        float width = max(_CrackWidth * age, 1.5 * _CellSize);
+        float cut = _CrackDepth * age * saturate(1.0 - abs(distance) / width);
+        // Weathering rounds the lips: a shallow channel with a round profile, wider than the crack, follows it.
+        float weathering = _CrackWeathering * age;
+        if (weathering > 0.0)
+        {
+            float mouth = width * (1.0 + 3.0 * weathering);
+            float bell = saturate(1.0 - distance * distance / (mouth * mouth));
+            cut = max(cut, 0.6 * weathering * mouth * bell * bell);
+        }
+        // A crack shows as a line where it meets the surface steeply. Where it runs nearly along the surface, it would carve
+        // a broad hollow, so it fades out there.
+        float facing = 1.0 - smoothstep(0.55, 0.8, abs(dot(node.normal, surfaceNormal)));
+        // Where cracks meet, the deeper crack wins, so a junction is not twice as deep.
+        result = max(result, field + cut * facing);
+    }
+    _Field[index] = result;
+}
+
+// Signed distance of each mesh point to the nearest crack of its part, divided by the age share of that crack, so a younger
+// crack draws a thinner line. A crack that runs nearly along the surface draws no line.
+[numthreads(64, 1, 1)]
+void CrackLines(uint3 id : SV_DispatchThreadID)
+{
+    int pointIndex = (int)id.x;
+    if (pointIndex >= _CrackPointCount) return;
+    float3 position = _CrackPoints[pointIndex];
+    float3 normal = _CrackNormals[pointIndex];
+    float sides[32];
+    bool inside[32];
+    float best = 10.0;
+    for (int item = 0; item < _CrackNodeCount; item++)
+    {
+        CrackNode node = _CrackNodes[item];
+        float distance = CrackFaceDistance(node, position);
+        sides[item] = distance;
+        bool here = node.parent < 0 || (inside[node.parent] && (sides[node.parent] >= 0.0 ? 1 : -1) == node.side);
+        inside[item] = here;
+        if (!here || abs(dot(node.normal, normal)) > 0.7) continue;
+        float scaled = distance / pow(max(_CrackAge, 1e-3), node.generation);
+        if (abs(scaled) < abs(best)) best = scaled;
+    }
+    _CrackLineDistances[pointIndex] = best;
+}

@@ -28,11 +28,11 @@ namespace LoogaSoft.Terrain
                 {
                     TerrainData data = renderer.Source.terrainData;
                     signature = unchecked(signature * 31 + (renderer.SupportsSurfaceBatching ? 1 : 0));
-                    signature = unchecked(signature * 31 + renderer._surfaceMaterial.GetInstanceID());
+                    signature = unchecked(signature * 31 + renderer.ActiveSurfaceMaterial.GetInstanceID());
                     signature = unchecked(signature * 31 + renderer.gameObject.layer);
                     signature = unchecked(signature * 31 + data.heightmapResolution);
                     signature = unchecked(signature * 31 + data.holesResolution);
-                    signature = unchecked(signature * 31 + renderer._minimumSurfaceBatchTiles);
+                    signature = unchecked(signature * 31 + renderer.MinimumSurfaceBatchTiles);
                 }
                 if (signature != _surfaceSignature)
                 {
@@ -49,7 +49,7 @@ namespace LoogaSoft.Terrain
                         if (!height || !holes) continue;
                         var cell = new Vector2Int(Mathf.FloorToInt(renderer._origin.x / (data.size.x * 4)),
                             Mathf.FloorToInt(renderer._origin.z / (data.size.z * 4)));
-                        var key = (renderer._surfaceMaterial, data.heightmapResolution, data.holesResolution,
+                        var key = (renderer.ActiveSurfaceMaterial, data.heightmapResolution, data.holesResolution,
                             height.graphicsFormat, holes.graphicsFormat, renderer.gameObject.layer, cell);
                         if (!groups.TryGetValue(key, out List<int> group))
                         {
@@ -63,7 +63,7 @@ namespace LoogaSoft.Terrain
                         int minimum = 2;
                         foreach (int index in group)
                         {
-                            minimum = Mathf.Max(minimum, _members[index]._minimumSurfaceBatchTiles);
+                            minimum = Mathf.Max(minimum, _members[index].MinimumSurfaceBatchTiles);
                         }
                         TerrainData source = _members[group[0]].Source.terrainData;
                         long bytesPerTile = (long)source.heightmapResolution * source.heightmapResolution * 2
@@ -122,7 +122,7 @@ namespace LoogaSoft.Terrain
                     _layer = firstRenderer.gameObject.layer;
                     foreach (int index in indices)
                     {
-                        _minimumTiles = Mathf.Max(_minimumTiles, owner._members[index]._minimumSurfaceBatchTiles);
+                        _minimumTiles = Mathf.Max(_minimumTiles, owner._members[index].MinimumSurfaceBatchTiles);
                     }
                     try
                     {

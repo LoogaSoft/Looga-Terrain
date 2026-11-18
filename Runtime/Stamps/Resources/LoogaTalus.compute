@@ -1,0 +1,262 @@
+// Looga Stamps talus stamp. Heights are in heightmap texture units. The apron holds the heights before the stamp over
+// the target plus the stamp reach on each side (see LoogaHeightSmooth.compute for the apron and the target layout).
+// The stamp raises the ground at the toe of steep faces:
+// 1. Steep: samples steeper than the face angle.
+// 2. Seed: gentle samples next to a higher steep sample, with low ground in front. The toe of a face has them. The rim
+//    and the benches on a face do not.
+// 3. Distance: the distance from the toe across gentle ground (one texel per pass).
+// 4. Raise: gentle ground rises by the apron height at the toe, down to zero at the apron reach.
+// 5. Fill: the raised toe spreads into the face as a cone with the talus slope, so the face base is buried.
+#pragma kernel Steepness
+#pragma kernel Seed
+#pragma kernel Distance
+#pragma kernel Raise
+#pragma kernel Dilate
+#pragma kernel ClearWeight
+#pragma kernel WaterWeight
+#pragma kernel ApplyTalus
+
+#include "../Shaders/HeightStampCore.hlsl"
+#include "../Shaders/TextureStampCore.hlsl"
+#include "../Shaders/WaterFilter.hlsl"
+
+#define FAR_DISTANCE 1e6
+#define NO_SOURCE -1e6
+
+int _TileResolution;
+int _Halo;
+int _Reach;
+int2 _TargetSize;
+int2 _ApronSize;
+
+Texture2D<float> _ApronIn;
+RWTexture2D<float> _Steep;
+Texture2D<float> _SteepIn;
+RWTexture2D<float> _DistanceOut;
+Texture2D<float> _DistanceIn;
+RWTexture2D<float> _Raised;
+Texture2D<float> _RaisedIn;
+Texture2D<float> _DilateIn;
+RWTexture2D<float> _DilateOut;
+RWTexture2D<float> _Weight;
+Texture2D<float> _WeightIn;
+RWTexture2D<float> _Target;
+
+// Heights in heightmap texture units, distances in metres unless noted.
+float _SteepSlope;
+float _SeedRise;
+int _SeedRadius;
+float _SeedDrop;
+int _FaceRadius;
+float _MinimumFaceRise;
+float _MaximumRise;
+float _ApronHeight;
+float _ApronReachTexels;
+float _ProfilePower;
+float _HeightVariation;
+float _VariationSize;
+float _StepAxis;
+float _StepDiagonal;
+float _Strength;
+float2 _ApronOrigin;
+float _TexelSize;
+int _HeightNoiseType;
+float4 _HeightNoiseParams;
+
+static const int2 Offsets[8] =
+{
+    int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1), int2(1, 1), int2(-1, 1), int2(1, -1), int2(-1, -1)
+};
+
+float TalusHash(float2 p)
+{
+    float3 p3 = frac(float3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return frac((p3.x + p3.y) * p3.z);
+}
+
+float TalusValueNoise(float2 p)
+{
+    float2 i = floor(p);
+    float2 f = frac(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return lerp(lerp(TalusHash(i), TalusHash(i + float2(1, 0)), f.x),
+                lerp(TalusHash(i + float2(0, 1)), TalusHash(i + float2(1, 1)), f.x), f.y);
+}
+
+float LoadApron(int2 p)
+{
+    return _ApronIn[clamp(p, 0, _ApronSize - 1)];
+}
+
+[numthreads(8, 8, 1)]
+void Steepness(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _ApronSize)) return;
+    int2 p = (int2)id.xy;
+    // Slope in height units per texel over a wide stencil, so small benches on a face stay steep.
+    const int span = 3;
+    float dx = (LoadApron(p + int2(span, 0)) - LoadApron(p - int2(span, 0))) / (2.0 * span);
+    float dy = (LoadApron(p + int2(0, span)) - LoadApron(p - int2(0, span))) / (2.0 * span);
+    _Steep[p] = length(float2(dx, dy)) > _SteepSlope ? 1 : 0;
+}
+
+[numthreads(8, 8, 1)]
+void Seed(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _ApronSize)) return;
+    int2 p = (int2)id.xy;
+    float distance = FAR_DISTANCE;
+    if (_SteepIn[p] < 0.5)
+    {
+        float height = _ApronIn[p];
+        bool belowFace = false;
+        for (int i = 0; i < 8; i++)
+        {
+            int2 q = clamp(p + Offsets[i], 0, _ApronSize - 1);
+            if (_SteepIn[q] > 0.5 && _ApronIn[q] > height + _SeedRise)
+            {
+                belowFace = true;
+                break;
+            }
+        }
+        // A bench on a face has the face below it. A toe has gentle ground in front of it.
+        float lowest = height;
+        if (belowFace)
+        {
+            for (int y = -_SeedRadius; y <= _SeedRadius; y++)
+            {
+                for (int x = -_SeedRadius; x <= _SeedRadius; x++)
+                {
+                    lowest = min(lowest, LoadApron(p + int2(x, y)));
+                }
+            }
+        }
+        // A low cut, such as a road cut or a river bank, does not rise far enough above the toe.
+        float highest = height;
+        if (belowFace && height - lowest <= _SeedDrop)
+        {
+            for (int y = -_FaceRadius; y <= _FaceRadius; y++)
+            {
+                for (int x = -_FaceRadius; x <= _FaceRadius; x++)
+                {
+                    highest = max(highest, LoadApron(p + int2(x, y)));
+                }
+            }
+            if (highest - height >= _MinimumFaceRise) distance = 0;
+        }
+    }
+    _DistanceOut[p] = distance;
+}
+
+[numthreads(8, 8, 1)]
+void Distance(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _ApronSize)) return;
+    int2 p = (int2)id.xy;
+    float distance = _DistanceIn[p];
+    // The distance runs over gentle ground only, so it does not cross a face to its other side.
+    if (_SteepIn[p] < 0.5)
+    {
+        for (int i = 0; i < 8; i++)
+        {
+            int2 q = clamp(p + Offsets[i], 0, _ApronSize - 1);
+            if (_SteepIn[q] > 0.5) continue;
+            distance = min(distance, _DistanceIn[q] + (i < 4 ? 1.0 : 1.41421356));
+        }
+    }
+    _DistanceOut[p] = distance;
+}
+
+[numthreads(8, 8, 1)]
+void Raise(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _ApronSize)) return;
+    int2 p = (int2)id.xy;
+    if (_SteepIn[p] > 0.5)
+    {
+        _Raised[p] = NO_SOURCE;
+        return;
+    }
+    // The apron height changes slowly along the foot, so the talus is not one constant band.
+    float2 world = _ApronOrigin + float2(id.xy) * _TexelSize;
+    float noise = TalusValueNoise(world / max(_VariationSize, 1.0)) * 0.65 +
+                  TalusValueNoise(world / max(_VariationSize * 0.37, 1.0) + 17.3) * 0.35;
+    float apronHeight = _ApronHeight * max(0.0, 1.0 + _HeightVariation * (2.0 * noise - 1.0));
+    float t = saturate(_DistanceIn[p] / max(_ApronReachTexels, 1.0));
+    float rise = apronHeight * pow(1.0 - t, _ProfilePower);
+    // Only the apron fills the face. Other ground is no cone source, so a bench cannot fill the face below it.
+    _Raised[p] = rise > 0 ? _ApronIn[p] + rise : NO_SOURCE;
+}
+
+[numthreads(8, 8, 1)]
+void Dilate(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _ApronSize)) return;
+    int2 p = (int2)id.xy;
+    float best = _DilateIn[p];
+    for (int i = 0; i < 8; i++)
+    {
+        int2 q = clamp(p + Offsets[i], 0, _ApronSize - 1);
+        best = max(best, _DilateIn[q] - (i < 4 ? _StepAxis : _StepDiagonal));
+    }
+    _DilateOut[p] = best;
+}
+
+[numthreads(8, 8, 1)]
+void ClearWeight(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _TargetSize)) return;
+    _Weight[id.xy] = 1;
+}
+
+float2 SampleTerrainUv(int2 target)
+{
+    return float2(target - _Halo) / (_TileResolution - 1);
+}
+
+[numthreads(8, 8, 1)]
+void WaterWeight(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _TargetSize)) return;
+    float height = _ApronIn[(int2)id.xy + _Reach];
+    float2 tileUv = (float2((int2)id.xy - _Halo) + 0.5) / _TileResolution;
+    _Weight[id.xy] *= WaterFilterWeight(SampleTerrainUv(id.xy), NoiseUv(tileUv), height);
+}
+
+[numthreads(8, 8, 1)]
+void ApplyTalus(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _TargetSize)) return;
+    int2 apron = (int2)id.xy + _Reach;
+    float height = _ApronIn[apron];
+    float2 tileUv = (float2((int2)id.xy - _Halo) + 0.5) / _TileResolution;
+    float2 stampUv = mul(_TileToStamp, float4(tileUv, 0, 1)).xy;
+    if (any(stampUv < 0) || any(stampUv > 1))
+    {
+        _Target[id.xy] = height;
+        return;
+    }
+    FalloffInput input;
+    input.stampUv = stampUv;
+    input.stampUvDx = _TileToStamp._m00_m10 / _TileResolution;
+    input.stampUvDy = _TileToStamp._m01_m11 / _TileResolution;
+    input.tileUv = tileUv;
+    input.worldNoiseUv = NoiseUv(tileUv);
+    float weight = StampFalloff(input, _RealHeight) * _Strength * _WeightIn[id.xy];
+    // Gentle ground takes its raised height. A steep sample only rises where the cone from the toe is higher.
+    float result = max(height, _SteepIn[apron] > 0.5 ? _DilateIn[apron] : _RaisedIn[apron]);
+    result = min(result, height + _MaximumRise);
+    float raise = result - height;
+    if (weight <= 0 || raise <= 0)
+    {
+        _Target[id.xy] = height;
+        return;
+    }
+    if (IsFbmNoise(_HeightNoiseType))
+    {
+        float noise = TypedNoiseValue(_HeightNoiseType, input.worldNoiseUv, _HeightNoiseParams) / _RealHeight;
+        raise = max(0.0, raise + noise * saturate(raise / max(_ApronHeight, 1e-6)));
+    }
+    _Target[id.xy] = clamp(height + raise * weight, 0, MAXIMUM_HEIGHT);
+}

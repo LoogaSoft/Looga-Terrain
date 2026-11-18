@@ -3,12 +3,13 @@
 Looga Terrain 0.1.0-preview.15 is a Unity 6.3 URP renderer prototype. It reads native TerrainData and retains native TerrainColliders.
 
 The GPU selects terrain patches and writes indirect draw arguments. The renderer submits the visible surface and a separate shadow list.
-The core has no MicroSplat or MicroVerse references. Integrations have separate assemblies with package version constraints.
+The core has no MicroSplat references. Integrations have separate assemblies with package version constraints.
+The optional MicroVerse integration was removed. Looga Stamps (`LoogaStampWorld`) generates terrain instead.
 
-General BRG rendering, containers, mesh painting and scene-object ownership come from the shared **Looga Instancing** dependency.
+General BRG rendering, containers, mesh painting and scene-object ownership come from the Instancing subsystem of the **Looga Graphics Pro** dependency.
 Terrain vegetation providers and ground/tool integration remain in this package. See [instance documentation](Documentation~/instances.md).
-Resident and streamed TerrainData trees and details publish derived occupancy to the shared world-cell registry after uploads complete. This does not change TerrainData, MicroVerse authoring, native fallback, or collider ownership.
-Terrain patch Hi-Z uses Looga Instancing's shared camera visibility context. It does not create a second depth pyramid when instances use the same camera scope.
+Resident and streamed TerrainData trees and details publish derived occupancy to the shared world-cell registry after uploads complete. This does not change TerrainData, stamp authoring, native fallback, or collider ownership.
+Terrain patch Hi-Z uses the shared camera visibility context of Graphics Pro Instancing. It does not create a second depth pyramid when instances use the same camera scope.
 
 ## Requirements
 
@@ -25,17 +26,22 @@ Terrain patch Hi-Z uses Looga Instancing's shared camera visibility context. It 
 4. Save the scene after the report shows the expected terrain and camera counts.
 
 The controller discovers every terrain and base camera in its scene. It adds terrain surfaces, vegetation providers,
-camera support, and the shared Hi-Z renderer feature. Optional setup extensions configure installed MicroSplat and
-MicroVerse integrations. Generated materials stay under `Assets/Looga/Generated/Terrain` by default.
+camera support, and the shared Hi-Z renderer feature. Optional setup extensions configure installed MicroSplat
+integrations. Generated materials stay under `Assets/Looga/Generated/Terrain` by default.
+
+Terrain quality is shared through **Terrain Renderer Settings** assets (**Create > Looga > Terrain > Terrain Renderer
+Settings**): patch count, error pixels, frustum culling, shadow casting, shadow error texels and surface batching. On
+`LoogaWorldController`, **Terrain Settings** applies to every terrain, and each **Terrain Groups** entry applies its
+settings to the terrains below its root (the first matching group wins). The controller assigns the asset to each
+`TerrainRenderer`. A renderer with an asset ignores its local values; edits to the asset change all its terrains
+during the next camera render, and a patch count change builds their resources again. Both inspectors show the
+values of the assigned assets. Neighbor tiles must keep equal patch counts, so give adjacent groups the same patch
+count.
 
 For authored scene vegetation, rocks, or repeated props, drag only their top-level static or LODGroup objects into
 **Scene Instance Roots**. The controller creates one shared `SceneInstanceProvider`; supported roots move to BRG and
 unsupported roots stay on native rendering with a report. Looga never scans all scene meshes or takes ownership of
 buildings, characters, transparent objects, or interactive props implicitly.
-
-Assign generated MicroVerse object containers to **MicroVerse Object Outputs** when those objects should use the same
-instancing path. The controller connects their refresh to MicroVerse synchronization. Leaving the list empty keeps
-those outputs native.
 
 Enable **Use Terrain Virtual Texturing** when the surface cache is useful for the target world. The controller creates
 one shared settings asset with GPU feedback compaction, parallel feedback processing, and cache compression. Basic
@@ -71,7 +77,7 @@ at a distance set by the radius of the rows in front of it, so large and small p
 Heights follow the cliff below the spline when Relative To Cliff is on. Depth and Density in the Wall section control
 the group footprint, and Outline Noise and End Taper break up the silhouette. Rarely used settings are in the
 collapsed Advanced section. Data saved with the older Thickness range loads as a radius of half that width. Six-, seven-, and eight-sided columns share a small set of worn and cracked meshes and render through
-Looga Instancing.
+Graphics Pro Instancing.
 
 Use **Build Local Preview** while authoring. Preview Center and Preview Length isolate a short spline section so an
 incorrect direction or scale cannot fill the scene. Use **Build Whole Spline** only after that section is approved;
@@ -109,17 +115,12 @@ Core integration guards allow each optional package to report and clear its own 
 ## Roads, object blending, vegetation and water
 
 These integrations keep the native authoring components and data. Looga replaces only the terrain surface.
-MicroVerse Roads and RAM remain optional. The core does not reference their assemblies.
+RAM remains optional. The core does not reference its assemblies.
 
-### MicroVerse Roads and vegetation
+### Terrain vegetation
 
-Keep RoadSystem, Road and the generated road meshes. Keep MicroVerseTerrainBridge on the authoring root.
-Use MicroVerse's normal road regeneration and terrain update commands.
-The bridge refreshes Looga after MicroVerse publishes terrain changes. Road meshes continue to use their native materials.
-
-MicroVerse TreeStamp and DetailStamp continue to write native tree instances and detail layers. Keep the native Terrain enabled because it remains the authoring and fallback source.
-Add `TerrainVegetationProvider` when those trees and mesh details should use Looga Instancing. The provider reads TerrainData without rewriting it, transfers visibility only after the complete population is ready, and restores the prior Draw Trees And Foliage state when disabled. Unsupported prototypes, active vendor owners, streaming warmup, and MicroVerse synchronization retain native rendering with a diagnostic.
-Use `MicroVerseVegetationBridge` to suspend the provider while MicroVerse publishes terrain changes. `MicroVersePlacementBridge` performs the same reversible handoff for generated object roots and refreshes painted exclusion masks after synchronization.
+Stamps and terrain tools write native tree instances and detail layers. Keep the native Terrain enabled because it remains the authoring and fallback source.
+Add `TerrainVegetationProvider` when those trees and mesh details should use Graphics Pro Instancing. The provider reads TerrainData without rewriting it, transfers visibility only after the complete population is ready, and restores the prior Draw Trees And Foliage state when disabled. Unsupported prototypes, active vendor owners, streaming warmup, and unsynchronized heights retain native rendering with a diagnostic.
 Use tree prefabs with qualified mesh, LOD and wind shaders. Instanced details require a supported mesh prefab and material. Unsupported populations stay native rather than disappearing.
 
 ### MicroSplat Terrain Blending
@@ -201,7 +202,7 @@ Disable **Blend Mip Transitions** to sample one virtual level per pixel. Disable
 
 The built-in `Looga/Terrain/Lit` surface can merge compatible tiles into one indirect surface submission. Surface batching starts at four tiles by default. It excludes MicroSplat derivatives, terrain RVT receivers and integration-bound materials because those surfaces need per-tile bindings. Use `SetSurfaceBatching` to change the threshold.
 
-Shadow batching is also adaptive and starts at four compatible tiles. Small groups retain per-tile shadow submissions to avoid texture-array setup overhead. Configure it on `TerrainOcclusionCamera`.
+Terrain shadows come from one shadow BatchRendererGroup for all tiles. It draws the tiles as static shadow casters, so Looga Shadows caches them in its coarse levels. For each culling split it selects light-space patches on the GPU: a patch is split while its height error is larger than **Shadow Error Texels** times the texel size of the split. The selection does not depend on the camera. It works with Looga Shadows and with URP shadows, also for spot and point lights. Each shadow view uses a set of buffers sized to its split count, about 1.2 MB per split for 37 tiles. Player builds need the **Shadow Shader** reference (`Runtime/Shaders/TerrainBatchedShadows.shader`); `LoogaWorldSetupUtility` and `TerrainRenderer.Configure` assign it. Terrain shadows use the TerrainData heights and holes. Clipping in a surface material does not reach the shadows.
 
 Use `SetProjectedQuality` to set the projected patch target used for native-parity comparisons. `RequestQualityMetrics` reports visible and shadow patch counts plus estimated triangle counts. Compare native and Looga with the same camera, render scale, shadow distance, material, and screen-space error before treating timing differences as renderer savings.
 
@@ -289,16 +290,9 @@ CPU feedback processing, sparse demand, rapid camera cuts and long multi-camera 
 Cache quality depends on virtual resolution, physical capacity, feedback rate and fill budget.
 Additional MicroSplat modules, clean optional-dependency absence and Looga Graphics Pro deferred integration remain unverified or unsupported.
 
-## MicroVerse and other authoring tools
+## Authoring tools
 
-Add MicroVerseTerrainBridge on the MicroVerse root or assign its MicroVerse field explicitly.
-The bridge discovers Looga renderers on the source terrains by default. Explicit renderer targets remain available.
-Use MicroVerse's AlwaysUnity proxy mode. Other proxy modes block Looga rendering with a diagnostic.
-An active proxy retains visibility ownership. Looga resumes when the source returns to AlwaysUnity.
-
-The bridge observes public begin, completion, cancellation and terrain-layer events.
-It checks CPU height synchronization separately from generation completion. It does not request generation or saveback.
-Do not save terrain until MicroVerse modification has stopped and its height synchronization is complete.
+Do not save terrain until stamp updates have stopped and height synchronization is complete.
 
 The core observes native height and texture callbacks, texture revisions and editor Undo.
 Height changes rebuild geometry metadata. Surface-only changes invalidate bindings and cached pages.
@@ -308,7 +302,7 @@ Live values must not affect the cached base surface. Removing a live binder clea
 The MicroSplat bridge binds the current control textures and provides a live Streams texture binding.
 This is a binding foundation; Streams shading and other dynamic modules remain blocked until their shader paths are implemented and checked.
 
-Two isolated adjacent tiles passed MicroVerse generation, RAM carving and painting, layer growth and shrinkage,
+With the former MicroVerse integration, two isolated adjacent tiles passed generation, RAM carving and painting, layer growth and shrinkage,
 height Undo, TerrainData replacement, rendered holes and cached-page refresh checks.
 The carved seam matched on both tiles, and the native colliders retained the expected TerrainData.
 RAM still owns its water meshes, materials and collisions. Water rendering and all authoring modules are not yet qualified.
@@ -321,7 +315,7 @@ Thirty-two core tests cover patch coverage, height-error selection, orthographic
 They also cover interior and cross-tile edges, native visibility and collider preservation.
 Virtual-texture tests cover page addressing, eviction, multiple physical slices, edits, settings changes, close-detail fallback, holes and component lifecycle.
 Eleven optional MicroSplat tests cover feature admission, fallback, material synchronization and source replacement.
-Four optional MicroVerse tests cover synchronization reporting, proxy transitions and terrain membership.
+Four optional MicroVerse tests covered synchronization reporting, proxy transitions and terrain membership. They were removed with the integration.
 All 47 cases passed. The final repeat invoked their NUnit methods in place to preserve dirty open scenes.
 Seven isolated assembly compiler checks passed for optional-package and player boundaries. These are not clean UPM consumer imports or complete player builds.
 Batch tests compare four mixed-setting tiles with independent selection. They check counter resets, buffer offsets, and neighbor edges.
@@ -432,8 +426,7 @@ This is a CPU submission count, not the number of GPU draws across all render pa
 
 ## Preview limits
 
-Optional camera components now provide terrain Hi-Z and conservative light-aware shadow culling.
-Offscreen selected patches remain in the shadow list. Shadow detail follows camera LOD.
+An optional camera component provides terrain Hi-Z. Shadow detail follows the texel size of each shadow split, not the camera LOD.
 An isolated check covered two cameras, camera movement, height/hole edits, and renderer reconfiguration. Large multi-camera workloads and moving LOD transitions need further validation.
 Finite-difference normals can differ at a tile edge; this preview does not sample a neighboring tile's height texture.
 
@@ -451,7 +444,7 @@ Core assembly isolation is designed for optional packages; a clean consumer with
 ## Windows installed-module qualification
 
 The release target is Unity 6000.3.21f1, URP 17.3, Windows and Direct3D 12.
-The MicroSplat version is 3.9. The MicroVerse version is 1.7.
+The MicroSplat version is 3.9.
 
 There are three explicit rendering routes:
 
@@ -473,7 +466,7 @@ New virtual surface exports record a source-code schema in both materials. A mis
 Re-export old pairs to add this check. Legacy pairs with no schema remain supported for migration.
 A schema identifies generated source code, not arbitrary changes to textures or material values. Use the normal material synchronization API for those changes.
 
-MicroVerse roads, splines, objects, ambiance and vegetation retain their native components. Terrain changes use public MicroVerse events and native TerrainData notifications.
+Terrain changes use native TerrainData notifications.
 Native trees, details, object meshes, road meshes and RAM water remain outside the terrain surface cache. They keep their original rendering and authoring paths.
 RAM materials are not automatically changed into Graphics Pro RVT receivers.
 
@@ -533,33 +526,21 @@ Native height callbacks carry a bounded metadata update. LastMetadataNodeCount r
 Unknown changes, source replacement and explicit RefreshSource calls use complete metadata rebuilds.
 
 Add TerrainOcclusionCamera to a rendering camera to use the optional visibility passes.
-Add InstanceOcclusionRendererFeature from Looga Instancing to the selected URP renderer for Hi-Z.
-Assign Runtime/Shaders/TerrainBatchedShadows.shader to enable compatible shadow batches.
-Keep the shadow shader reference in the build. Configure retains its first shader argument for serialized compatibility, but temporal Hi-Z no longer uses the old terrain-only depth shader.
-For shadow culling without Hi-Z, use Configure(null, shadowShader, true, false).
+Add InstanceOcclusionRendererFeature from Graphics Pro Instancing to the selected URP renderer for Hi-Z.
+Configure retains its first shader argument for serialized compatibility, but temporal Hi-Z no longer uses the old terrain-only depth shader.
 
-Hi-Z consumes the same prior-frame opaque-depth pyramid as Looga Instancing. Terrain and vegetation therefore share one 512 by 512 hierarchy, one reduction pass and the same camera-cut checks. The terrain path no longer redraws terrain into a private full-resolution depth target or reduces that target a second time.
+Hi-Z consumes the same prior-frame opaque-depth pyramid as Graphics Pro Instancing. Terrain and vegetation therefore share one 512 by 512 hierarchy, one reduction pass and the same camera-cut checks. The terrain path no longer redraws terrain into a private full-resolution depth target or reduces that target a second time.
 The shared depth contains all opaque objects rendered by the camera. Transparent water does not act as an occluder. Camera cuts, projection changes and configurable movement thresholds fail visible; moving opaque occluders can expose terrain one frame before matching depth history is available.
-Each camera owns shared history in the renderer feature. Disabling the terrain component releases its consumer lease and shadow groups; inactive camera history is reclaimed by the feature.
+Each camera owns shared history in the renderer feature. Disabling the terrain component releases its consumer lease; inactive camera history is reclaimed by the feature.
 Stereo and unsupported graphics APIs do not use this path. Large camera stacks need separate workload qualification.
 The component does not add itself to Scene View cameras.
 
 The depth contract is the LoogaTerrainDepth material tag with value NativeHeightsAndHoles.
 The basic surface and compatible new MicroSplat exports declare this contract.
 Re-export existing MicroSplat surfaces before using their geometry as occluders or generic shadow casters.
-Material alpha holes and unknown depth contracts retain their original material shadow passes and cannot act as simplified occluders.
+Material alpha holes and unknown depth contracts cannot act as simplified occluders.
 Do not add this tag to a shader with different displacement or clipping behavior.
 
-Directional-light culling retains patches whose shadow extrusion can reach the padded camera view.
-Point and spot lights retain every caster inside their range. Unknown light types or more than 16 shadow lights retain all casters.
-This is conservative receiver-view culling, not a separate optimal selection for each shadow cascade.
-Shadow LOD still follows the viewing camera.
-
-Shadow batches group nearby tiles with matching source dimensions and scene layers.
-Texture arrays preserve the player BC4 hole format. Source copies occur after texture revisions.
-Each group limits duplicate source storage to 128 MiB. Other storage includes patch, mapping and argument buffers.
-Unsupported groups retain per-tile shadow submissions. Surface draws retain their individual MicroSplat material bindings.
-Cross-tile surface-material batching is not implemented by this shadow path.
 
 Assign VirtualTextureCompact.compute through VirtualTextureSettings.ConfigureFeedbackCompaction to compact requests before GPU readback.
 A bounded GPU hash table counts duplicate leaf requests. Readback transfers the header and unique key/count pairs.
@@ -577,6 +558,7 @@ The final 37-terrain world comparison used 72 Windows/D3D12 Deferred+ cases on a
 All 81 terrain tests passed. The player reported no runtime errors; existing project warnings remain.
 The following table compares the existing compressed cache with compact feedback and shadow culling together.
 Hi-Z and shadow batching are disabled in the selected profile. Values are means of two whole-frame medians in milliseconds.
+These results predate the shadow BatchRendererGroup. The shadow culling and shadow batching options no longer exist.
 
 | View | Existing GPU | Selected GPU | Existing CPU | Selected CPU |
 | --- | ---: | ---: | ---: | ---: |
@@ -590,8 +572,3 @@ The retired terrain-only Hi-Z rejected only one extra ground patch in this view,
 Spatial shadow batching reduced ground submissions from 54 to 28 after culling, but also cost more GPU time.
 Keep those two options opt-in. The benchmark runner accepts -looga-visibility for all nine modes, including Balanced.
 These measurements do not establish a universal FPS gain. Native and Looga LOD quality are not calibrated equivalents.
-## MicroVerse 1.7 road shader build limit
-
-The optional MicroVerse editor integration removes invalid DOTS variants from three generated MicroVerse 1.7 shaders that target shader model 3.0. Both local and global keyword declarations are handled. Native road rendering and terrain authoring remain available, and vendor files remain unchanged. The workaround is restricted to package version 1.7.0 and the known generated asset paths.
-
-The shared editor validator also rejects their known Unity compiler errors before instance ownership. This safeguard does not add BRG support to those low-target road shaders. Keep these generated roads under their native renderer, or use a separately validated DOTS-capable material before conversion. A future MicroVerse version must be checked again instead of inheriting this version-specific workaround.

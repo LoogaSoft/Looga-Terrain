@@ -11,7 +11,7 @@ Shader "Hidden/Looga/Ground Cache Probe"
             #pragma fragment Fragment
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
             #define LOOGA_GROUND_CACHE
-            #include "Packages/com.loogasoft.loogainstancing/ShaderLibrary/VegetationGroundCache.hlsl"
+            #include "Packages/com.loogasoft.loogagraphicspro/Instancing/ShaderLibrary/VegetationGroundCache.hlsl"
             float4 _ProbeWorld;
             int _ProbeChannel;
             float4 Vertex(uint id : SV_VertexID) : SV_POSITION

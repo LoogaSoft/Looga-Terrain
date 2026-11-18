@@ -7,6 +7,23 @@ using UnityEngine.Rendering.Universal;
 
 namespace LoogaSoft.Terrain
 {
+    /// <summary>Assigns shared terrain renderer settings to the terrains below one hierarchy root.</summary>
+    [Serializable]
+    public struct TerrainSettingsGroup
+    {
+        [SerializeField] private Transform _root;
+        [SerializeField] private TerrainRendererSettings _settings;
+
+        public TerrainSettingsGroup(Transform root, TerrainRendererSettings settings)
+        {
+            _root = root;
+            _settings = settings;
+        }
+
+        public Transform Root => _root;
+        public TerrainRendererSettings Settings => _settings;
+    }
+
     /// <summary>Stores one scene's Looga Terrain setup policy and owned objects.</summary>
     [AddComponentMenu("Looga/World Controller")]
     [DisallowMultipleComponent]
@@ -15,12 +32,15 @@ namespace LoogaSoft.Terrain
         [Header("Terrain")]
         [SerializeField] private bool _renderTerrain = true;
         [SerializeField] private bool _renderVegetation = true;
-        [SerializeField, Range(8, 128)] private int _patchCount = 64;
-        [SerializeField, Range(0.25f, 16f)] private float _errorPixels = 2f;
-        [SerializeField] private bool _castTerrainShadows = true;
+        [Tooltip("Renderer settings of the terrains that no group contains. Empty keeps the values of each " +
+                 "TerrainRenderer.")]
+        [SerializeField] private TerrainRendererSettings _terrainSettings;
+        [Tooltip("Renderer settings of the terrains below each root. The first group that contains a terrain applies.")]
+        [SerializeField] private TerrainSettingsGroup[] _terrainGroups = Array.Empty<TerrainSettingsGroup>();
 
         [Header("Vegetation")]
-        [Tooltip("Shared tree and detail defaults with source-specific overrides. Null preserves each terrain's local settings.")]
+        [Tooltip("Shared detail, tree and object defaults with source overrides. " +
+                 "Empty keeps the local settings of each terrain, InstanceSet and InstanceContainer.")]
         [SerializeField] private VegetationSettings _vegetationSettings;
         [Tooltip("Use the full-quality Looga vegetation renderer in Scene view. Terrain editing temporarily restores native rendering.")]
         [SerializeField] private bool _previewVegetationInEditor;
@@ -32,7 +52,6 @@ namespace LoogaSoft.Terrain
         [Header("Visibility")]
         [SerializeField] private bool _configureVisibility = true;
         [SerializeField] private bool _useHiZ = true;
-        [SerializeField] private bool _cullTerrainShadows = true;
         [SerializeField] private bool _configureWaterCameras = true;
         [SerializeField] private Camera[] _cameras = Array.Empty<Camera>();
         [SerializeField] private ScriptableRendererData _rendererData;
@@ -45,9 +64,6 @@ namespace LoogaSoft.Terrain
 
         [Header("Integrations")]
         [SerializeField] private bool _configureMicroSplat = true;
-        [SerializeField] private bool _configureMicroVerse = true;
-        [Tooltip("Optional generated-object roots refreshed after MicroVerse synchronization.")]
-        [SerializeField] private Transform[] _microVerseObjectOutputs = Array.Empty<Transform>();
         [SerializeField] private string _generatedAssetFolder = "Assets/Looga/Generated/Terrain";
 
         [SerializeField, HideInInspector] private Component[] _ownedComponents = Array.Empty<Component>();
@@ -56,14 +72,12 @@ namespace LoogaSoft.Terrain
 
         public bool RenderTerrain => _renderTerrain;
         public bool RenderVegetation => _renderVegetation;
-        public int PatchCount => _patchCount;
-        public float ErrorPixels => _errorPixels;
-        public bool CastTerrainShadows => _castTerrainShadows;
+        public TerrainRendererSettings TerrainSettings => _terrainSettings;
+        public TerrainSettingsGroup[] TerrainGroups => _terrainGroups;
         public bool UseTerrainVirtualTexturing => _useTerrainVirtualTexturing;
         public VirtualTextureSettings VirtualTextureSettings => _virtualTextureSettings;
         public bool ConfigureVisibility => _configureVisibility;
         public bool UseHiZ => _useHiZ;
-        public bool CullTerrainShadows => _cullTerrainShadows;
         public bool ConfigureWaterCameras => _configureWaterCameras;
         public Camera[] Cameras => _cameras;
         public ScriptableRendererData RendererData => _rendererData;
@@ -71,8 +85,6 @@ namespace LoogaSoft.Terrain
         public InstanceMaterialProfile InstanceMaterialProfile => _instanceMaterialProfile;
         public float InstanceMaxDistance => _instanceMaxDistance;
         public bool ConfigureMicroSplat => _configureMicroSplat;
-        public bool ConfigureMicroVerse => _configureMicroVerse;
-        public Transform[] MicroVerseObjectOutputs => _microVerseObjectOutputs;
         public string GeneratedAssetFolder => _generatedAssetFolder;
         public Component[] OwnedComponents => _ownedComponents;
         public ScriptableRendererFeature OwnedRendererFeature => _ownedRendererFeature;
@@ -91,6 +103,7 @@ namespace LoogaSoft.Terrain
             WarnIfAnotherControllerIsActive();
             if (Application.isPlaying)
             {
+                ApplyTerrainSettings();
                 try
                 {
                     ApplyVegetationSettings();
@@ -102,54 +115,125 @@ namespace LoogaSoft.Terrain
             }
         }
 
-        /// <summary>Assigns shared vegetation settings to the providers in this world scene.</summary>
+        /// <summary>
+        /// Stores the terrain renderer settings and assigns them to the terrain renderers in this world scene.
+        /// </summary>
+        public void SetTerrainSettings(TerrainRendererSettings settings, TerrainSettingsGroup[] groups = null)
+        {
+            _terrainSettings = settings;
+            _terrainGroups = groups == null
+                ? Array.Empty<TerrainSettingsGroup>()
+                : (TerrainSettingsGroup[])groups.Clone();
+            ApplyTerrainSettings();
+        }
+
+        /// <summary>
+        /// Gets the settings of one terrain: those of the first group whose root contains it, otherwise the shared
+        /// terrain settings. Null keeps the values of the TerrainRenderer.
+        /// </summary>
+        public TerrainRendererSettings GetTerrainSettings(Transform terrain)
+        {
+            foreach (TerrainSettingsGroup group in _terrainGroups)
+            {
+                if (group.Root && terrain && terrain.IsChildOf(group.Root)) return group.Settings;
+            }
+            return _terrainSettings;
+        }
+
+        /// <summary>Finds this scene's terrain renderers, including inactive terrain objects.</summary>
+        public TerrainRenderer[] GetTerrainRenderers()
+        {
+            return FindInScene<TerrainRenderer>();
+        }
+
+        /// <summary>Assigns the terrain settings to every terrain renderer in this world scene.</summary>
+        public void ApplyTerrainSettings()
+        {
+            foreach (TerrainRenderer renderer in GetTerrainRenderers())
+            {
+                renderer.SetSettings(GetTerrainSettings(renderer.transform));
+            }
+        }
+
+        /// <summary>
+        /// Assigns shared vegetation settings to the terrain providers, InstanceSets and InstanceContainers in this
+        /// world scene.
+        /// </summary>
         public void SetVegetationSettings(VegetationSettings settings)
         {
-            ApplyToProviders(settings);
+            ApplyToSources(settings);
             _vegetationSettings = settings;
         }
 
         /// <summary>Finds this scene's terrain providers, including inactive terrain objects.</summary>
         public TerrainVegetationProvider[] GetVegetationProviders()
         {
-            var scene = gameObject.scene;
-            if (!scene.IsValid() || !scene.isLoaded) return Array.Empty<TerrainVegetationProvider>();
-            var providers = new List<TerrainVegetationProvider>();
-            foreach (GameObject root in scene.GetRootGameObjects())
-            {
-                providers.AddRange(root.GetComponentsInChildren<TerrainVegetationProvider>(true));
-            }
-            return providers.ToArray();
+            return FindInScene<TerrainVegetationProvider>();
+        }
+
+        /// <summary>Finds this scene's InstanceSets, including inactive objects.</summary>
+        public InstanceSet[] GetInstanceSets()
+        {
+            return FindInScene<InstanceSet>();
+        }
+
+        /// <summary>Finds this scene's InstanceContainers, including inactive objects.</summary>
+        public InstanceContainer[] GetInstanceContainers()
+        {
+            return FindInScene<InstanceContainer>();
         }
 
         /// <summary>Applies the shared policy without changing source terrain data or placements.</summary>
         public void ApplyVegetationSettings()
         {
-            ApplyToProviders(_vegetationSettings);
+            ApplyToSources(_vegetationSettings);
         }
 
-        private void ApplyToProviders(VegetationSettings settings)
+        private T[] FindInScene<T>() where T : Component
         {
-            TerrainVegetationProvider[] providers = GetVegetationProviders();
-            var previous = new VegetationSettings[providers.Length];
-            int assigned = 0;
+            var scene = gameObject.scene;
+            if (!scene.IsValid() || !scene.isLoaded) return Array.Empty<T>();
+            var components = new List<T>();
+            foreach (GameObject root in scene.GetRootGameObjects())
+            {
+                components.AddRange(root.GetComponentsInChildren<T>(true));
+            }
+            return components.ToArray();
+        }
+
+        // A failed assignment restores the earlier settings of every source, so the world does not mix two policies.
+        private void ApplyToSources(VegetationSettings settings)
+        {
+            var rollback = new List<Action>();
             try
             {
-                for (int i = 0; i < providers.Length; i++)
+                foreach (TerrainVegetationProvider provider in GetVegetationProviders())
                 {
-                    previous[i] = providers[i].VegetationSettings;
-                    providers[i].SetVegetationSettings(settings);
-                    assigned++;
+                    VegetationSettings previous = provider.VegetationSettings;
+                    provider.SetVegetationSettings(settings);
+                    rollback.Add(() => provider.SetVegetationSettings(previous));
+                }
+                foreach (InstanceSet set in GetInstanceSets())
+                {
+                    ScriptableObject previous = set.QualitySource;
+                    set.SetQualitySource(settings);
+                    rollback.Add(() => set.SetQualitySource(previous));
+                }
+                foreach (InstanceContainer container in GetInstanceContainers())
+                {
+                    ScriptableObject previous = container.QualitySource;
+                    container.SetQualitySource(settings);
+                    rollback.Add(() => container.SetQualitySource(previous));
                 }
             }
             catch (Exception assignmentError)
             {
                 Exception rollbackError = null;
-                for (int i = assigned - 1; i >= 0; i--)
+                for (int i = rollback.Count - 1; i >= 0; i--)
                 {
                     try
                     {
-                        providers[i].SetVegetationSettings(previous[i]);
+                        rollback[i]();
                     }
                     catch (Exception exception)
                     {
@@ -157,7 +241,10 @@ namespace LoogaSoft.Terrain
                     }
                 }
                 if (rollbackError != null)
-                    throw new AggregateException("Vegetation settings and rollback both failed.", assignmentError, rollbackError);
+                {
+                    throw new AggregateException("Vegetation settings and rollback both failed.", assignmentError,
+                        rollbackError);
+                }
                 throw;
             }
         }
@@ -182,12 +269,10 @@ namespace LoogaSoft.Terrain
 
         private void OnValidate()
         {
-            _patchCount = Mathf.Clamp(Mathf.ClosestPowerOfTwo(_patchCount), 8, 128);
-            _errorPixels = Mathf.Clamp(_errorPixels, 0.25f, 16f);
+            _terrainGroups ??= Array.Empty<TerrainSettingsGroup>();
             _instanceMaxDistance = Mathf.Max(1, _instanceMaxDistance);
             _cameras ??= Array.Empty<Camera>();
             _instanceRoots ??= Array.Empty<GameObject>();
-            _microVerseObjectOutputs ??= Array.Empty<Transform>();
             _ownedComponents ??= Array.Empty<Component>();
         }
 
@@ -210,12 +295,6 @@ namespace LoogaSoft.Terrain
             _instanceMaxDistance = maxDistance;
         }
 
-        /// <summary>Assigns public MicroVerse-generated object roots for synchronized BRG rendering.</summary>
-        public void SetMicroVerseObjectOutputs(Transform[] outputs)
-        {
-            _microVerseObjectOutputs = outputs == null ? Array.Empty<Transform>() : (Transform[])outputs.Clone();
-        }
-
         /// <summary>Enables or disables the terrain surface cache for scripted setup.</summary>
         public void ConfigureVirtualTexturing(bool enabled, VirtualTextureSettings settings = null)
         {
@@ -231,16 +310,14 @@ namespace LoogaSoft.Terrain
 
         /// <summary>Sets the main setup features for scripted scene installation.</summary>
         public void ConfigureFeatures(bool terrain, bool vegetation, bool visibility, bool hiZ,
-            bool terrainShadowCulling, bool waterCameras, bool microSplat = true, bool microVerse = true)
+            bool waterCameras, bool microSplat = true)
         {
             _renderTerrain = terrain;
             _renderVegetation = vegetation;
             _configureVisibility = visibility;
             _useHiZ = hiZ;
-            _cullTerrainShadows = terrainShadowCulling;
             _configureWaterCameras = waterCameras;
             _configureMicroSplat = microSplat;
-            _configureMicroVerse = microVerse;
         }
 
         /// <summary>Sets the folder for consumer-owned generated assets.</summary>

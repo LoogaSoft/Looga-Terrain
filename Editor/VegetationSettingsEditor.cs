@@ -9,6 +9,7 @@ namespace LoogaSoft.Terrain.Editor
     {
         private bool _details = true;
         private bool _trees;
+        private bool _objects;
         private string _error;
 
         private void OnEnable()
@@ -45,6 +46,8 @@ namespace LoogaSoft.Terrain.Editor
             if (_details) LoogaWorldControllerEditor.DrawDefaults(profile, VegetationKind.Detail, ref _error);
             _trees = EditorGUILayout.Foldout(_trees, "Tree defaults", true);
             if (_trees) LoogaWorldControllerEditor.DrawDefaults(profile, VegetationKind.Tree, ref _error);
+            _objects = EditorGUILayout.Foldout(_objects, "Object defaults", true);
+            if (_objects) LoogaWorldControllerEditor.DrawDefaults(profile, VegetationKind.Object, ref _error);
             EditorGUILayout.Space();
             EditorGUILayout.LabelField("Source overrides", EditorStyles.boldLabel);
             EditorGUILayout.HelpBox("Select Looga World in the scene to inspect the source catalog and edit individual override fields.", MessageType.Info);

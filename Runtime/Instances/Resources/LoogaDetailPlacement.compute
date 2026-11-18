@@ -77,8 +77,7 @@ SourceTransform PlaceInstance(uint cell, uint ordinal, PlacementLayer layer)
     uint detailWidth = (uint)_PlacementLayout.z;
     uint seed = DetailHash(cell ^ layer.seed) ^ DetailHash(ordinal + 1);
     float2 texel = float2(cell % detailWidth, cell / detailWidth);
-    // Placement fills the whole texel. A narrower spread leaves empty bands at texel edges, which show a grid.
-    float2 uv = (texel + float2(DetailRandom(seed), DetailRandom(seed + 1))) / detailWidth;
+    float2 uv = DetailPosition(texel, seed, detailWidth);
     int holeResolution = _PlacementLayout.y;
     int2 center = clamp((int2)(uv * holeResolution), 0, holeResolution - 1);
     int2 padding = (int2)ceil(layer.holePadding * holeResolution / _TerrainSize.xz);

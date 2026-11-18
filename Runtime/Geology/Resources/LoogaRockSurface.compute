@@ -1,0 +1,416 @@
+// Builds a tiling rock surface as a height map. Each kernel reads _Source and writes _Field, and all noise repeats at the
+// tile edge. The steps follow height map rock materials: plates from tilted gradients with capped peaks, a slope blur for
+// worn edges, crack lines multiplied into the height, and fine grain. WriteMaps turns the height into texture maps.
+#pragma kernel Clouds
+#pragma kernel Plates
+#pragma kernel Cracks
+#pragma kernel SlopeBlur
+#pragma kernel Multiply
+#pragma kernel Grain
+#pragma kernel Blur
+#pragma kernel WriteMaps
+#pragma kernel WriteStain
+#pragma kernel MineralGrain
+
+RWStructuredBuffer<float> _Field;
+StructuredBuffer<float> _Source;
+// Height of the slope that a slope blur follows, or the mask of a multiply.
+StructuredBuffer<float> _Second;
+StructuredBuffer<float> _WideBlur;
+StructuredBuffer<float> _NearBlur;
+// 1 away from a vein, and 0 on a vein.
+StructuredBuffer<float> _Veins;
+RWTexture2D<float4> _AlbedoMap;
+RWTexture2D<float4> _NormalMap;
+RWTexture2D<float4> _MaskMap;
+RWTexture2D<float4> _StainMap;
+
+int _Resolution;
+int _Period;
+// Cells across the tile along V. More cells than along U gives long cells: on a rock face, V is height, so the cracks then
+// run along the layers. Whole numbers keep the tile edge.
+int _PeriodV;
+int _Octaves;
+int _Seed;
+float _Amount;
+float _Warp;
+float _Tilt;
+float _Cap;
+float _DepthJitter;
+float _Width;
+float _Profile;
+float _Persistence;
+int _Samples;
+float _Reach;
+float _Lowest;
+int2 _Axis;
+int _Radius;
+float _Sigma;
+
+float _HeightBias;
+float _HeightScale;
+float _Slope;
+float _OcclusionScale;
+float _CurvatureScale;
+float _ColorVariation;
+float _HeightColor;
+float _Flecks;
+float _GrainWarmth;
+float _GrainClump;
+int _ClumpPeriod;
+float4 _VeinColor;
+float4 _LowColor;
+float4 _MidColor;
+float4 _HighColor;
+float _SmoothLow;
+float _SmoothHigh;
+float _Speckle;
+int _SpecklePeriod;
+float _VeinLight;
+
+int Index(int2 pixel)
+{
+    pixel = (pixel % _Resolution + _Resolution) % _Resolution;
+    return pixel.x + _Resolution * pixel.y;
+}
+
+float2 PixelUv(uint2 id)
+{
+    return (float2(id) + 0.5) / _Resolution;
+}
+
+// PCG3D hash (Jarzynski and Olano 2020).
+uint3 Hash(int3 cell)
+{
+    uint3 value = uint3(cell) * 1664525u + 1013904223u;
+    value.x += value.y * value.z;
+    value.y += value.z * value.x;
+    value.z += value.x * value.y;
+    value ^= value >> 16u;
+    value.x += value.y * value.z;
+    value.y += value.z * value.x;
+    value.z += value.x * value.y;
+    return value;
+}
+
+// Three random values from 0 to 1. The cell wraps at the period, so the tile repeats.
+float3 Chance(int2 cell, int period, int salt)
+{
+    cell = (cell % period + period) % period;
+    return float3(Hash(int3(cell, _Seed + salt)) >> 16u) / 65535.0;
+}
+
+// Three random values of a cell of the plate and crack grid.
+float3 CellChance(int2 cell, int salt)
+{
+    int2 period = int2(_Period, _PeriodV);
+    cell = (cell % period + period) % period;
+    return float3(Hash(int3(cell, _Seed + salt)) >> 16u) / 65535.0;
+}
+
+float ValueNoise(float2 location, int period, int salt)
+{
+    float2 low = floor(location);
+    int2 cell = int2(low);
+    float2 share = location - low;
+    share = share * share * (3.0 - 2.0 * share);
+    float bottom = lerp(Chance(cell, period, salt).x, Chance(cell + int2(1, 0), period, salt).x, share.x);
+    float top = lerp(Chance(cell + int2(0, 1), period, salt).x, Chance(cell + int2(1, 1), period, salt).x, share.x);
+    return lerp(bottom, top, share.y);
+}
+
+// Layered value noise from 0 to 1. Each layer has twice the period, so each layer repeats at the tile edge.
+float CloudNoise(float2 uv, int period, int octaves, int salt)
+{
+    float sum = 0.0;
+    float total = 0.0;
+    float amplitude = 1.0;
+    for (int octave = 0; octave < octaves; octave++)
+    {
+        sum += amplitude * ValueNoise(uv * period, period, salt + octave * 37);
+        total += amplitude;
+        amplitude *= 0.5;
+        period *= 2;
+    }
+    return sum / total;
+}
+
+float2 WarpUv(float2 uv)
+{
+    if (_Warp <= 0.0) return uv;
+    // Many layers, so a border wanders at each size and has no straight part.
+    float2 offset = float2(CloudNoise(uv, 5, 7, 301), CloudNoise(uv, 5, 7, 419)) - 0.5;
+    return uv + offset * _Warp;
+}
+
+// Distance to the nearest cell border (Quilez, voronoi borders), with the vector to the nearest cell point.
+void CellSearch(float2 location, out float border, out float2 nearest, out int2 nearestCell)
+{
+    int2 cell = int2(floor(location));
+    float2 offset = location - floor(location);
+    float closest = 1e9;
+    nearest = 0.0;
+    int2 nearestMove = 0;
+    for (int y = -1; y <= 1; y++)
+    {
+        for (int x = -1; x <= 1; x++)
+        {
+            int2 move = int2(x, y);
+            float2 delta = float2(move) + CellChance(cell + move, 11).xy - offset;
+            float separation = dot(delta, delta);
+            if (separation < closest)
+            {
+                closest = separation;
+                nearest = delta;
+                nearestMove = move;
+            }
+        }
+    }
+
+    nearestCell = cell + nearestMove;
+    border = 1e9;
+    for (int wideY = -2; wideY <= 2; wideY++)
+    {
+        for (int wideX = -2; wideX <= 2; wideX++)
+        {
+            int2 move = nearestMove + int2(wideX, wideY);
+            float2 delta = float2(move) + CellChance(cell + move, 11).xy - offset;
+            float2 between = delta - nearest;
+            float separation = dot(between, between);
+            if (separation < 1e-5) continue;
+            border = min(border, dot(0.5 * (nearest + delta), between / sqrt(separation)));
+        }
+    }
+}
+
+[numthreads(32, 32, 1)]
+void Clouds(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= uint2(_Resolution, _Resolution))) return;
+    _Field[Index(int2(id.xy))] = CloudNoise(PixelUv(id.xy), _Period, _Octaves, 53);
+}
+
+// One plate is a tilted gradient with a capped peak and its own depth. Its shoulder falls to the cell border. Later
+// layers subtract smaller plates from the same height.
+[numthreads(32, 32, 1)]
+void Plates(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= uint2(_Resolution, _Resolution))) return;
+    int index = Index(int2(id.xy));
+    float2 location = WarpUv(PixelUv(id.xy)) * float2(_Period, _PeriodV);
+    float border;
+    float2 nearest;
+    int2 cell;
+    CellSearch(location, border, nearest, cell);
+    float3 chance = CellChance(cell, 71);
+    float angle = chance.x * 6.28318;
+    float tilted = 0.5 + dot(nearest, float2(cos(angle), sin(angle))) * _Tilt + (chance.y - 0.5) * _DepthJitter;
+    float capped = min(tilted, _Cap);
+    float shoulder = pow(saturate(border / _Width), _Profile);
+    _Field[index] = _Source[index] + _Amount * (capped * shoulder - _Cap);
+}
+
+// Lines along the cell borders. Value 1 lies away from a crack. A noise ends some cracks in the rock.
+[numthreads(32, 32, 1)]
+void Cracks(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= uint2(_Resolution, _Resolution))) return;
+    float2 uv = PixelUv(id.xy);
+    float border;
+    float2 nearest;
+    int2 cell;
+    CellSearch(WarpUv(uv) * float2(_Period, _PeriodV), border, nearest, cell);
+    float open = smoothstep(1.0 - _Persistence - 0.1, 1.0 - _Persistence + 0.1, CloudNoise(uv, 5, 3, 137));
+    _Field[Index(int2(id.xy))] = 1.0 - (1.0 - saturate(border / _Width)) * open;
+}
+
+// A blur along the slope of a second height. With _Lowest 1, the result is the lowest sample, which wears raised edges.
+[numthreads(32, 32, 1)]
+void SlopeBlur(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= uint2(_Resolution, _Resolution))) return;
+    int2 pixel = int2(id.xy);
+    float2 slope = float2(_Second[Index(pixel + int2(1, 0))] - _Second[Index(pixel - int2(1, 0))],
+                          _Second[Index(pixel + int2(0, 1))] - _Second[Index(pixel - int2(0, 1))]);
+    float steepness = length(slope);
+    float2 direction = steepness > 1e-6 ? slope / steepness : float2(1.0, 0.0);
+    float reach = _Reach * saturate(steepness * 40.0);
+    float lowest = _Source[Index(pixel)];
+    float sum = lowest;
+    for (int sampleIndex = 1; sampleIndex <= _Samples; sampleIndex++)
+    {
+        float2 offset = direction * reach * sampleIndex / _Samples;
+        float value = _Source[Index(pixel + int2(round(offset)))];
+        lowest = min(lowest, value);
+        sum += value;
+    }
+    _Field[Index(pixel)] = lerp(sum / (_Samples + 1), lowest, _Lowest);
+}
+
+[numthreads(32, 32, 1)]
+void Multiply(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= uint2(_Resolution, _Resolution))) return;
+    int index = Index(int2(id.xy));
+    _Field[index] = _Source[index] - _Amount * (1.0 - _Second[index]);
+}
+
+[numthreads(32, 32, 1)]
+void Grain(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= uint2(_Resolution, _Resolution))) return;
+    int index = Index(int2(id.xy));
+    float noise = CloudNoise(PixelUv(id.xy), _Period, _Octaves, 211);
+    float ridged = 1.0 - abs(2.0 * CloudNoise(PixelUv(id.xy), _Period / 2, _Octaves, 503) - 1.0);
+    _Field[index] = _Source[index] + _Amount * ((noise - 0.5) + 0.5 * (ridged - 0.75));
+}
+
+[numthreads(32, 32, 1)]
+void Blur(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= uint2(_Resolution, _Resolution))) return;
+    int2 pixel = int2(id.xy);
+    float sum = 0.0;
+    float total = 0.0;
+    for (int offset = -_Radius; offset <= _Radius; offset++)
+    {
+        float weight = exp(-0.5 * offset * offset / (_Sigma * _Sigma));
+        sum += weight * _Source[Index(pixel + _Axis * offset)];
+        total += weight;
+    }
+    _Field[Index(pixel)] = sum / total;
+}
+
+// Flat mineral grains: each cell of a jittered grid has one value. Smooth noise has little contrast at its cell size, so it
+// fades in the mip chain. A mosaic keeps its contrast at the distance of a rock.
+float GrainMosaic(float2 uv, int period, int salt)
+{
+    float2 location = uv * period;
+    int2 cell = int2(floor(location));
+    float2 offset = location - floor(location);
+    float closest = 1e9;
+    float value = 0.0;
+    for (int y = -1; y <= 1; y++)
+    {
+        for (int x = -1; x <= 1; x++)
+        {
+            float3 chance = Chance(cell + int2(x, y), period, salt);
+            float2 delta = float2(x, y) + chance.xy - offset;
+            float separation = dot(delta, delta);
+            if (separation < closest)
+            {
+                closest = separation;
+                value = chance.z;
+            }
+        }
+    }
+    return value;
+}
+
+// Mineral grains in the height. In the normal map they catch the light, so the base color can stay flat.
+[numthreads(32, 32, 1)]
+void MineralGrain(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= uint2(_Resolution, _Resolution))) return;
+    int index = Index(int2(id.xy));
+    float2 uv = PixelUv(id.xy);
+    float grains = 0.6 * GrainMosaic(uv, _Period, 701) + 0.4 * GrainMosaic(uv, _Period * 2, 709);
+    _Field[index] = _Source[index] + _Amount * (grains - 0.5);
+}
+
+// Layered value noise with its own period on each axis. Each layer has twice the period, so the tile repeats.
+float StretchedNoise(float2 uv, int2 period, int octaves, int salt)
+{
+    float sum = 0.0;
+    float total = 0.0;
+    float amplitude = 1.0;
+    for (int octave = 0; octave < octaves; octave++)
+    {
+        float2 location = uv * float2(period);
+        float2 low = floor(location);
+        int2 cell = int2(low);
+        float2 share = location - low;
+        share = share * share * (3.0 - 2.0 * share);
+        int layerSalt = _Seed + salt + octave * 41;
+        int2 cellB = (cell + int2(1, 0)) % period;
+        int2 cellC = (cell + int2(0, 1)) % period;
+        int2 cellD = (cell + int2(1, 1)) % period;
+        float a = float(Hash(int3(cell % period, layerSalt)).x >> 16u) / 65535.0;
+        float b = float(Hash(int3(cellB, layerSalt)).x >> 16u) / 65535.0;
+        float c = float(Hash(int3(cellC, layerSalt)).x >> 16u) / 65535.0;
+        float d = float(Hash(int3(cellD, layerSalt)).x >> 16u) / 65535.0;
+        sum += amplitude * lerp(lerp(a, b, share.x), lerp(c, d, share.x), share.y);
+        total += amplitude;
+        amplitude *= 0.55;
+        period *= 2;
+    }
+    return sum / total;
+}
+
+// Base color from the height through three colors. Curvature and occlusion enter in small amounts.
+[numthreads(32, 32, 1)]
+void WriteMaps(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= uint2(_Resolution, _Resolution))) return;
+    int2 pixel = int2(id.xy);
+    float height = (_Source[Index(pixel)] - _HeightBias) * _HeightScale;
+    float right = (_Source[Index(pixel + int2(1, 0))] - _HeightBias) * _HeightScale;
+    float left = (_Source[Index(pixel - int2(1, 0))] - _HeightBias) * _HeightScale;
+    float up = (_Source[Index(pixel + int2(0, 1))] - _HeightBias) * _HeightScale;
+    float down = (_Source[Index(pixel - int2(0, 1))] - _HeightBias) * _HeightScale;
+    float3 normal = normalize(float3((left - right) * _Slope, (down - up) * _Slope, 1.0));
+
+    float wide = (_WideBlur[Index(pixel)] - _HeightBias) * _HeightScale;
+    float near = (_NearBlur[Index(pixel)] - _HeightBias) * _HeightScale;
+    float occlusion = saturate(1.0 - max(wide - height, 0.0) * _OcclusionScale);
+    float curvature = clamp((height - near) * _CurvatureScale, -1.0, 1.0);
+
+    float2 uv = PixelUv(id.xy);
+    float variation = CloudNoise(uv, 3, 5, 613) - 0.5;
+    // Height has only a small part in the color. With a full part, each bump of the height becomes a pale spot.
+    float shade = saturate(lerp(0.5, height, _HeightColor) + variation * _ColorVariation);
+    float3 color = shade < 0.5 ? lerp(_LowColor.rgb, _MidColor.rgb, shade * 2.0)
+                               : lerp(_MidColor.rgb, _HighColor.rgb, shade * 2.0 - 1.0);
+    // Flat color: the geometry makes the shading, and fine detail lies in the normal map.
+    color *= (1.0 + 0.06 * curvature) * lerp(0.94, 1.0, occlusion);
+    // Mineral grains of two sizes, with bright flecks at the peaks.
+    float grains = 0.6 * GrainMosaic(uv, _SpecklePeriod, 701) + 0.4 * GrainMosaic(uv, _SpecklePeriod * 2, 709);
+    // Rough mineral grain gathers in patches, and the rock between them is smooth sheared slate.
+    float clump = smoothstep(0.42, 0.58, CloudNoise(uv, _ClumpPeriod, 5, 719));
+    float allGrains = grains;
+    grains = lerp(0.5, grains, lerp(1.0, clump, _GrainClump));
+    color *= 1.0 + (grains - 0.5) * 2.0 * _Speckle;
+    color *= 1.0 + smoothstep(0.66, 0.8, grains) * _Flecks;
+    // Pale grains are warm and dark grains are cool, so the color follows the brightness at the scale of the grains.
+    color *= lerp(float3(1.0, 1.0, 1.0), lerp(float3(0.95, 0.98, 1.04), float3(1.07, 1.0, 0.9), saturate(grains * 1.4 - 0.2)),
+        _GrainWarmth);
+    // Pale mineral veins with a thin dark crack in the middle. The grain breaks the vein border.
+    float vein = (1.0 - _Veins[Index(pixel)]) * saturate(0.55 + 0.9 * grains);
+    float tint = max(dot(color, float3(0.3, 0.6, 0.1)) / 0.12, 0.5);
+    color = lerp(color, _VeinColor.rgb * tint, smoothstep(0.05, 0.55, vein) * _VeinLight);
+    color *= 1.0 - 0.75 * saturate(_VeinLight * 4.0) * smoothstep(0.82, 0.98, vein);
+
+    _AlbedoMap[id.xy] = float4(saturate(color), 1.0);
+    _NormalMap[id.xy] = float4(normal * 0.5 + 0.5, 1.0);
+    // R holds all mineral grains, with no clumps: RockFarGrain needs the same share of pale grains everywhere to keep its
+    // mean brightness. Worn edges of a generated rock turn the highest grains pale.
+    _MaskMap[id.xy] = float4(saturate(allGrains), occlusion, saturate(height),
+        lerp(_SmoothLow, _SmoothHigh, lerp(shade, 1.0 - clump, _GrainClump)));
+}
+
+// The stain map: large soft colors that do not repeat with the surface tile. The shader projects it in world space, with V
+// along height. R rust, G olive, B dark streaks that run down the rock, A mottle.
+[numthreads(32, 32, 1)]
+void WriteStain(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= uint2(_Resolution, _Resolution))) return;
+    float2 uv = PixelUv(id.xy);
+    float2 warp = float2(StretchedNoise(uv, int2(5, 5), 5, 811), StretchedNoise(uv, int2(5, 5), 5, 877)) - 0.5;
+    float2 warped = uv + warp * 0.12;
+    float rust = smoothstep(0.47, 0.66, StretchedNoise(warped, int2(5, 5), 7, 907));
+    float olive = smoothstep(0.47, 0.66, StretchedNoise(warped, int2(4, 4), 7, 953));
+    float fade = smoothstep(0.42, 0.6, StretchedNoise(warped, int2(4, 3), 5, 1009));
+    float streaks = smoothstep(0.44, 0.62, StretchedNoise(uv + float2(warp.x * 0.03, 0.0), int2(36, 3), 5, 1051)) * fade;
+    float mottle = StretchedNoise(warped, int2(9, 9), 7, 1103);
+    _StainMap[id.xy] = float4(rust, olive, streaks, mottle);
+}

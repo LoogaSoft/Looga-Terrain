@@ -4,7 +4,10 @@
   "references": [
     "LoogaSoft.Terrain.Runtime",
     "LoogaSoft.Terrain.Instances",
-    "LoogaSoft.Instancing",
+    "LoogaSoft.Terrain.Stamps",
+    "LoogaSoft.Terrain.Water",
+    "LoogaSoft.Terrain.ImageDecoding.Editor",
+    "LoogaSoft.Instancing.Runtime",
     "LoogaSoft.Instancing.Universal",
     "LoogaSoft.Inspector.Editor",
     "Unity.RenderPipelines.Universal.Runtime",

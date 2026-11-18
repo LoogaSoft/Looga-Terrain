@@ -1,0 +1,234 @@
+// Looga Stamps smooth stamp. Heights are in heightmap texture units. The target is the evaluation state of one tile:
+// the 16-bit tile texture in parity mode, the float work texture (tile plus halo) in World Aligned mode. The apron is
+// the target plus the blur reach on each side. It comes from the state of the tile before the smooth stamp (its prefix)
+// and from the border rings of its eight neighbours.
+#pragma kernel ExtractRing
+#pragma kernel BuildApron
+#pragma kernel BlurX
+#pragma kernel BlurY
+#pragma kernel ClearWeight
+#pragma kernel WaterWeight
+#pragma kernel ApplySmooth
+
+#include "../Shaders/HeightStampCore.hlsl"
+#include "../Shaders/TextureStampCore.hlsl"
+#include "../Shaders/WaterFilter.hlsl"
+
+// Border ring of a tile: the prefix samples within _RingDepth of each tile edge, in four strips of _TileResolution x
+// _RingDepth. Rows 0 to depth - 1 are the bottom edge, sample (x, j). The next rows are the top edge, (x, first + j),
+// then the left edge, (j, x), then the right edge, (first + j, x). first = resolution - depth.
+// Rings of the neighbours: slot = (z offset + 1) * 3 + (x offset + 1). Slot 4 is the tile: it reads its own state. A
+// missing neighbour has its mask bit cleared and the tile clamps to its own edge there.
+Texture2D<float> _Ring0;
+Texture2D<float> _Ring1;
+Texture2D<float> _Ring2;
+Texture2D<float> _Ring3;
+Texture2D<float> _Ring5;
+Texture2D<float> _Ring6;
+Texture2D<float> _Ring7;
+Texture2D<float> _Ring8;
+int _RingMask;
+int _RingDepth;
+Texture2D<float> _State;
+RWTexture2D<float> _RingOut;
+int _TileResolution;
+int _Halo;
+int _Reach;
+int2 _TargetSize;
+int2 _ApronSize;
+float _SigmaTexels;
+
+RWTexture2D<float> _Apron;
+Texture2D<float> _ApronIn;
+RWTexture2D<float> _BlurTemp;
+Texture2D<float> _BlurTempIn;
+RWTexture2D<float> _Blurred;
+Texture2D<float> _BlurredIn;
+RWTexture2D<float> _Weight;
+Texture2D<float> _WeightIn;
+RWTexture2D<float> _Target;
+
+// Limits in heightmap texture units, noise in metres.
+float _MaxChange;
+float _Strength;
+int _HeightNoiseType;
+float4 _HeightNoiseParams;
+// Water rim: x = signed distance, y = water level of the first water filter area.
+int _KeepAboveWater;
+int _KeepUnderwater;
+Texture2D<float4> _RimField;
+float2 _RimFieldScale;
+float _RimWidth;
+float _WaterClearance;
+float _RimNotFound;
+
+[numthreads(8, 8, 1)]
+void ExtractRing(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _TileResolution || (int)id.y >= 4 * _RingDepth) return;
+    uint strip = id.y / (uint)_RingDepth;
+    int j = (int)(id.y - strip * (uint)_RingDepth);
+    int first = _TileResolution - _RingDepth;
+    int x = (int)id.x;
+    int2 sample;
+    if (strip == 0) sample = int2(x, j);
+    else if (strip == 1) sample = int2(x, first + j);
+    else if (strip == 2) sample = int2(j, x);
+    else sample = int2(first + j, x);
+    _RingOut[id.xy] = _State[sample + _Halo];
+}
+
+float LoadRing(int slot, int2 position)
+{
+    switch (slot)
+    {
+        case 0: return _Ring0[position];
+        case 1: return _Ring1[position];
+        case 2: return _Ring2[position];
+        case 3: return _Ring3[position];
+        case 5: return _Ring5[position];
+        case 6: return _Ring6[position];
+        case 7: return _Ring7[position];
+        default: return _Ring8[position];
+    }
+}
+
+// Ring position of a sample of the neighbour at the offset. The neighbour below gives its top edge, the neighbour above
+// its bottom edge, the left neighbour its right edge and the right neighbour its left edge. Corners use the strips of
+// the neighbour below or above.
+int2 RingPosition(int2 offset, int2 local)
+{
+    int first = _TileResolution - _RingDepth;
+    if (offset.y < 0) return int2(local.x, _RingDepth + clamp(local.y - first, 0, _RingDepth - 1));
+    if (offset.y > 0) return int2(local.x, clamp(local.y, 0, _RingDepth - 1));
+    if (offset.x < 0) return int2(local.y, 3 * _RingDepth + clamp(local.x - first, 0, _RingDepth - 1));
+    return int2(local.y, 2 * _RingDepth + clamp(local.x, 0, _RingDepth - 1));
+}
+
+[numthreads(8, 8, 1)]
+void BuildApron(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _ApronSize)) return;
+    // Tile sample index of this apron texel. Neighbour tiles share their edge samples with this tile.
+    int2 sample = (int2)id.xy - _Reach - _Halo;
+    int last = _TileResolution - 1;
+    int2 offset = int2(sample.x < 0 ? -1 : (sample.x > last ? 1 : 0), sample.y < 0 ? -1 : (sample.y > last ? 1 : 0));
+    int slot = (offset.y + 1) * 3 + (offset.x + 1);
+    if (slot == 4 || ((_RingMask >> slot) & 1) == 0)
+    {
+        _Apron[id.xy] = _State[clamp(sample, 0, last) + _Halo];
+        return;
+    }
+    _Apron[id.xy] = LoadRing(slot, RingPosition(offset, clamp(sample - offset * last, 0, last)));
+}
+
+float GaussianWeight(int offset)
+{
+    return exp(-(offset * offset) / (2.0 * _SigmaTexels * _SigmaTexels));
+}
+
+[numthreads(8, 8, 1)]
+void BlurX(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _ApronSize)) return;
+    float sum = 0;
+    float total = 0;
+    for (int k = -_Reach; k <= _Reach; k++)
+    {
+        int x = clamp((int)id.x + k, 0, _ApronSize.x - 1);
+        float weight = GaussianWeight(k);
+        sum += _ApronIn[int2(x, id.y)] * weight;
+        total += weight;
+    }
+    _BlurTemp[id.xy] = sum / total;
+}
+
+[numthreads(8, 8, 1)]
+void BlurY(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _ApronSize)) return;
+    float sum = 0;
+    float total = 0;
+    for (int k = -_Reach; k <= _Reach; k++)
+    {
+        int y = clamp((int)id.y + k, 0, _ApronSize.y - 1);
+        float weight = GaussianWeight(k);
+        sum += _BlurTempIn[int2(id.x, y)] * weight;
+        total += weight;
+    }
+    _Blurred[id.xy] = sum / total;
+}
+
+[numthreads(8, 8, 1)]
+void ClearWeight(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _TargetSize)) return;
+    _Weight[id.xy] = 1;
+}
+
+// Tile UV over the terrain size at the exact sample position, as the texture passes read the water fields.
+float2 SampleTerrainUv(int2 target)
+{
+    return float2(target - _Halo) / (_TileResolution - 1);
+}
+
+[numthreads(8, 8, 1)]
+void WaterWeight(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _TargetSize)) return;
+    float height = _ApronIn[(int2)id.xy + _Reach];
+    float2 tileUv = (float2((int2)id.xy - _Halo) + 0.5) / _TileResolution;
+    _Weight[id.xy] *= WaterFilterWeight(SampleTerrainUv(id.xy), NoiseUv(tileUv), height);
+}
+
+[numthreads(8, 8, 1)]
+void ApplySmooth(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _TargetSize)) return;
+    int2 apron = (int2)id.xy + _Reach;
+    float height = _ApronIn[apron];
+    // Stamp UV and falloff use the tile UV of the height passes, (i + 0.5) / resolution.
+    float2 tileUv = (float2((int2)id.xy - _Halo) + 0.5) / _TileResolution;
+    float2 stampUv = mul(_TileToStamp, float4(tileUv, 0, 1)).xy;
+    if (any(stampUv < 0) || any(stampUv > 1))
+    {
+        _Target[id.xy] = height;
+        return;
+    }
+    FalloffInput input;
+    input.stampUv = stampUv;
+    input.stampUvDx = _TileToStamp._m00_m10 / _TileResolution;
+    input.stampUvDy = _TileToStamp._m01_m11 / _TileResolution;
+    input.tileUv = tileUv;
+    input.worldNoiseUv = NoiseUv(tileUv);
+    float weight = StampFalloff(input, _RealHeight) * _Strength * _WeightIn[id.xy];
+    if (weight <= 0)
+    {
+        _Target[id.xy] = height;
+        return;
+    }
+    float result = _BlurredIn[apron];
+    if (IsFbmNoise(_HeightNoiseType))
+    {
+        result += TypedNoiseValue(_HeightNoiseType, input.worldNoiseUv, _HeightNoiseParams) / _RealHeight;
+    }
+    result = clamp(result, height - _MaxChange, height + _MaxChange);
+    if (_KeepAboveWater || _KeepUnderwater)
+    {
+        float2 water = _RimField.SampleLevel(looga_linear_clamp_sampler, SampleTerrainUv(id.xy) * _RimFieldScale, 0).xy;
+        float ground = height * _RealHeight + _TerrainHeight;
+        bool outside = water.x >= 0 && water.x < _RimNotFound;
+        if (_KeepAboveWater && outside && (water.x < _RimWidth || ground > water.y))
+        {
+            result = max(result, (water.y + _WaterClearance - _TerrainHeight) / _RealHeight);
+        }
+        // Ground below the water inside the water edge only goes down, so the blur cannot fill a bed from its banks.
+        // Far inside the water, x is -not found and y is the water surface.
+        if (_KeepUnderwater && water.x < 0 && ground < water.y)
+        {
+            result = min(result, height);
+        }
+        result = clamp(result, height - _MaxChange, height + _MaxChange);
+    }
+    _Target[id.xy] = clamp(lerp(height, result, weight), 0, MAXIMUM_HEIGHT);
+}

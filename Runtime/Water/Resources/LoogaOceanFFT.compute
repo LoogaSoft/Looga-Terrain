@@ -1,0 +1,286 @@
+// Ocean waves from a wave spectrum (Tessendorf, "Simulating Ocean Water"), with the spectrum, spreading and foam of
+// GodotOceanWaves (2Retr0, MIT): a TMA spectrum (JONSWAP with a depth term), Hasselmann spreading with swell, and a
+// small-wave detail term. Each cascade is a square tile with its own size, wind and shape, and each cascade holds the
+// full spectrum that its tile resolves. Init makes the random spectrum of a cascade once. Each frame, Evolve moves the
+// spectrum to the time, two inverse FFT passes (rows, then columns) give the fields, Assemble writes the displacement
+// and the slopes, and Foam adds whitecap foam where the surface is compressed and lets it decay.
+#pragma kernel Init
+#pragma kernel Evolve
+#pragma kernel FFTRows
+#pragma kernel FFTColumns
+#pragma kernel Assemble
+#pragma kernel Foam
+#pragma multi_compile_local _ OCEAN_SIZE_512 OCEAN_SIZE_1024
+
+#if defined(OCEAN_SIZE_1024)
+    #define SIZE 1024
+    #define LOG_SIZE 10
+#elif defined(OCEAN_SIZE_512)
+    #define SIZE 512
+    #define LOG_SIZE 9
+#else
+    #define SIZE 256
+    #define LOG_SIZE 8
+#endif
+#define PI 3.14159265
+#define GRAVITY 9.81
+
+// xy = h0(k), zw = h0(-k), for each cascade.
+RWTexture2DArray<float4> _Spectrum;
+// Two complex fields in each texel. A: (Dx + i Dz, Dy + i dDx/dz). B: (dDy/dx + i dDy/dz, dDx/dx + i dDz/dz).
+RWTexture2DArray<float4> _BufferA;
+RWTexture2DArray<float4> _BufferB;
+// xyz = horizontal and vertical displacement in metres, w = Jacobian of the horizontal displacement (below 0 = the
+// surface folds over a crest).
+RWTexture2DArray<float4> _Displacement;
+// xy = slope of the height along x and z, divided by 1 + the horizontal compression, so the crests stay sharp. zw =
+// choppiness times dDx/dx and dDz/dz.
+RWTexture2DArray<float4> _Derivatives;
+// Whitecap foam from 0 to 1. The previous step is read with filtering, for the wind drift.
+RWTexture2DArray<float> _Foam;
+Texture2DArray<float> _FoamPrevious;
+SamplerState sampler_linear_repeat;
+
+// For each cascade. Wind: x = wind speed in m/s, y = fetch in metres, z = wind direction in radians (spectrum angle),
+// w = spread (0 = the wind direction only, 1 = all directions).
+float4 _CascadeWind[4];
+// For each cascade. Shape: x = swell, y = detail (1 = keep the small waves), z = tile size in metres, w = time offset.
+float4 _CascadeShape[4];
+// For each cascade. Foam: x = whitecap (Jacobian below which foam grows), y = growth of this step, z = decay factor of
+// this step.
+float4 _CascadeFoam[4];
+// x = water depth in metres, y = height scale, z = choppiness, w = seed.
+float4 _Ocean;
+float _WaveTime;
+// x = streak share of this step, w = 0 to clear the foam.
+float4 _FoamStep;
+// xy = drift of this step along world X and Z in metres, zw = wind direction (unit vector in world XZ).
+float4 _FoamDrift;
+
+uint Hash(uint value)
+{
+    value ^= 2747636419u;
+    value *= 2654435769u;
+    value ^= value >> 16;
+    value *= 2654435769u;
+    value ^= value >> 16;
+    value *= 2654435769u;
+    return value;
+}
+
+// Two independent normal random numbers for a texel (Box-Muller).
+float2 Gaussian(uint2 texel, uint cascade)
+{
+    uint seed = Hash(texel.x + texel.y * SIZE + cascade * SIZE * SIZE + (uint)_Ocean.w * 7919u);
+    float u1 = max((Hash(seed) & 0xFFFFFF) / 16777216.0, 1e-7);
+    float u2 = (Hash(seed + 1) & 0xFFFFFF) / 16777216.0;
+    float radius = sqrt(-2.0 * log(u1));
+    return float2(radius * cos(2.0 * PI * u2), radius * sin(2.0 * PI * u2));
+}
+
+// Angular frequency of a wave number in water of the depth (finite-depth dispersion).
+float Frequency(float k)
+{
+    return sqrt(GRAVITY * k * tanh(min(k * _Ocean.x, 20.0)));
+}
+
+// Derivative of the frequency to the wave number.
+float FrequencyDerivative(float k, float omega)
+{
+    float a = k * _Ocean.x;
+    float b = tanh(min(a, 20.0));
+    return 0.5 * GRAVITY * (b + a * (1.0 - b * b)) / max(omega, 1e-5);
+}
+
+// TMA spectrum: JONSWAP for the wind speed and the fetch, times the Kitaigorodskii depth term.
+float TmaSpectrum(float omega, float peak, float alpha)
+{
+    float sigma = omega <= peak ? 0.07 : 0.09;
+    float r = exp(-(omega - peak) * (omega - peak) / (2.0 * sigma * sigma * peak * peak));
+    float ratio = peak / omega;
+    float jonswap = alpha * GRAVITY * GRAVITY / pow(omega, 5.0) * exp(-1.25 * ratio * ratio * ratio * ratio) *
+        pow(3.3, r);
+    float depthOmega = min(omega * sqrt(_Ocean.x / GRAVITY), 2.0);
+    float depthTerm = depthOmega <= 1.0 ? 0.5 * depthOmega * depthOmega :
+        1.0 - 0.5 * (2.0 - depthOmega) * (2.0 - depthOmega);
+    return jonswap * depthTerm;
+}
+
+// Hasselmann directional spreading with the swell term: a higher swell narrows the long waves to the wind direction.
+float Spreading(float omega, float peak, float angle, float wind, float swell)
+{
+    float p = omega / peak;
+    float s = omega <= peak ? 6.97 * pow(p, 4.06) :
+        9.77 * pow(p, -2.33 - 1.45 * (wind * peak / GRAVITY - 1.17));
+    s += 16.0 * tanh(peak / omega) * swell * swell;
+    // Normalization of |cos(angle / 2)|^(2s) over the full circle.
+    float normalization = s < 0.4 ? 1.0 / (2.0 * PI) + s * (0.220636 + s * (-0.109 + s * 0.090)) :
+        (0.5 * sqrt(s) + 0.0625 / sqrt(s)) / sqrt(PI);
+    return normalization * pow(abs(cos(angle * 0.5)), 2.0 * s);
+}
+
+float2 WaveVector(uint2 texel, float size)
+{
+    return (float2(texel) - SIZE / 2) * (2.0 * PI / size);
+}
+
+// Amplitude of a spectrum texel: a Gaussian random value times sqrt(2 S(omega) D(theta) domega/dk / k dk^2).
+float2 Amplitude(uint2 texel, uint cascade, float2 k)
+{
+    float4 wind = _CascadeWind[cascade];
+    float4 shape = _CascadeShape[cascade];
+    float kLength = length(k) + 1e-6;
+    float omega = Frequency(kLength);
+    float windSpeed = max(wind.x, 0.1);
+    float fetch = max(wind.y, 1.0);
+    float alpha = 0.076 * pow(windSpeed * windSpeed / (fetch * GRAVITY), 0.22);
+    float peak = 22.0 * pow(GRAVITY * GRAVITY / (windSpeed * fetch), 1.0 / 3.0);
+    float angle = atan2(k.y, k.x) - wind.z;
+    float spreading = lerp(Spreading(omega, peak, angle, windSpeed, shape.x), 1.0 / (2.0 * PI), wind.w);
+    spreading *= exp(-(1.0 - shape.y) * (1.0 - shape.y) * kLength * kLength);
+    float cell = 2.0 * PI / shape.z;
+    float energy = TmaSpectrum(omega, peak, alpha) * spreading * FrequencyDerivative(kLength, omega) / kLength *
+        cell * cell;
+    return Gaussian(texel, cascade) * sqrt(2.0 * energy) * _Ocean.y;
+}
+
+[numthreads(8, 8, 1)]
+void Init(uint3 id : SV_DispatchThreadID)
+{
+    float2 k = WaveVector(id.xy, _CascadeShape[id.z].z);
+    uint2 opposite = (SIZE - id.xy) % SIZE;
+    // The middle texel is k = 0: no wave.
+    bool centre = all(id.xy == SIZE / 2);
+    float2 h0 = centre ? 0 : Amplitude(id.xy, id.z, k);
+    float2 h0Opposite = centre ? 0 : Amplitude(opposite, id.z, -k);
+    _Spectrum[id] = float4(h0, h0Opposite);
+}
+
+float2 Multiply(float2 a, float2 b)
+{
+    return float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+// a + i b for two complex numbers a and b. After the inverse FFT of real fields, x is the field of a and y of b.
+float2 Pack(float2 a, float2 b)
+{
+    return float2(a.x - b.y, a.y + b.x);
+}
+
+[numthreads(8, 8, 1)]
+void Evolve(uint3 id : SV_DispatchThreadID)
+{
+    float2 k = WaveVector(id.xy, _CascadeShape[id.z].z);
+    float kLength = length(k);
+    float4 spectrum = _Spectrum[id];
+    float phase = Frequency(kLength) * (_WaveTime + _CascadeShape[id.z].w);
+    float2 turn = float2(cos(phase), sin(phase));
+    float2 h = Multiply(spectrum.xy, turn) + Multiply(float2(spectrum.z, -spectrum.w), float2(turn.x, -turn.y));
+    float2 ih = float2(-h.y, h.x);
+    float2 unit = kLength > 1e-6 ? k / kLength : 0;
+    // Horizontal displacement D = i k / |k| h moves the surface toward the crests (Gerstner trochoids), so the crests
+    // become sharp and the troughs wide. The derivatives below are the derivatives of this D.
+    float2 dx = unit.x * ih;
+    float2 dz = unit.y * ih;
+    float2 dxz = -unit.x * k.y * h;
+    float2 dyx = k.x * ih;
+    float2 dyz = k.y * ih;
+    float2 dxx = -unit.x * k.x * h;
+    float2 dzz = -unit.y * k.y * h;
+    _BufferA[id] = float4(Pack(dx, dz), Pack(h, dxz));
+    _BufferB[id] = float4(Pack(dyx, dyz), Pack(dxx, dzz));
+}
+
+groupshared float4 _SharedA[SIZE];
+groupshared float4 _SharedB[SIZE];
+
+// Inverse FFT of one line in group shared memory: the input is in bit-reversed order, and each stage joins pairs of
+// half-length transforms (radix-2, decimation in time). One thread computes one butterfly for all four fields.
+void InverseFFT(uint thread)
+{
+    [unroll]
+    for (uint stage = 1; stage <= LOG_SIZE; stage++)
+    {
+        GroupMemoryBarrierWithGroupSync();
+        if (thread < SIZE / 2)
+        {
+            uint span = 1u << (stage - 1);
+            uint position = thread & (span - 1);
+            uint first = (thread >> (stage - 1)) * (span * 2) + position;
+            uint second = first + span;
+            float angle = PI * position / span;
+            float2 twiddle = float2(cos(angle), sin(angle));
+            float4 a0 = _SharedA[first];
+            float4 a1 = _SharedA[second];
+            float4 b0 = _SharedB[first];
+            float4 b1 = _SharedB[second];
+            float4 ta = float4(Multiply(twiddle, a1.xy), Multiply(twiddle, a1.zw));
+            float4 tb = float4(Multiply(twiddle, b1.xy), Multiply(twiddle, b1.zw));
+            _SharedA[first] = a0 + ta;
+            _SharedA[second] = a0 - ta;
+            _SharedB[first] = b0 + tb;
+            _SharedB[second] = b0 - tb;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+}
+
+uint Reverse(uint value)
+{
+    return reversebits(value) >> (32 - LOG_SIZE);
+}
+
+[numthreads(SIZE, 1, 1)]
+void FFTRows(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID)
+{
+    uint3 texel = uint3(thread.x, group.y, group.z);
+    _SharedA[Reverse(thread.x)] = _BufferA[texel];
+    _SharedB[Reverse(thread.x)] = _BufferB[texel];
+    InverseFFT(thread.x);
+    _BufferA[texel] = _SharedA[thread.x];
+    _BufferB[texel] = _SharedB[thread.x];
+}
+
+[numthreads(SIZE, 1, 1)]
+void FFTColumns(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID)
+{
+    uint3 texel = uint3(group.y, thread.x, group.z);
+    _SharedA[Reverse(thread.x)] = _BufferA[texel];
+    _SharedB[Reverse(thread.x)] = _BufferB[texel];
+    InverseFFT(thread.x);
+    _BufferA[texel] = _SharedA[thread.x];
+    _BufferB[texel] = _SharedB[thread.x];
+}
+
+[numthreads(8, 8, 1)]
+void Assemble(uint3 id : SV_DispatchThreadID)
+{
+    // The spectrum is centred on texel SIZE / 2, which shifts every result by (-1)^(x + y).
+    float sign = ((id.x + id.y) & 1) ? -1.0 : 1.0;
+    float4 a = _BufferA[id] * sign;
+    float4 b = _BufferB[id] * sign;
+    float chop = _Ocean.z;
+    float dxx = chop * b.z;
+    float dzz = chop * b.w;
+    float dxz = chop * a.w;
+    float jacobian = (1.0 + dxx) * (1.0 + dzz) - dxz * dxz;
+    _Displacement[id] = float4(chop * a.x, a.z, chop * a.y, jacobian);
+    _Derivatives[id] = float4(b.xy / (1.0 + abs(float2(dxx, dzz))), dxx, dzz);
+}
+
+// Foam grows where the Jacobian is below the whitecap value of the cascade and decays everywhere. It drifts with the
+// wind, and a blend with the texels one step up and down the wind stretches it into streaks.
+[numthreads(8, 8, 1)]
+void Foam(uint3 id : SV_DispatchThreadID)
+{
+    float size = _CascadeShape[id.z].z;
+    float4 foam = _CascadeFoam[id.z];
+    float2 uv = (id.xy + 0.5) / SIZE - _FoamDrift.xy / size;
+    float2 streak = _FoamDrift.zw / SIZE;
+    float previous = _FoamPrevious.SampleLevel(sampler_linear_repeat, float3(uv, id.z), 0);
+    float along = 0.5 * (_FoamPrevious.SampleLevel(sampler_linear_repeat, float3(uv + streak, id.z), 0) +
+        _FoamPrevious.SampleLevel(sampler_linear_repeat, float3(uv - streak, id.z), 0));
+    previous = lerp(previous, along, _FoamStep.x) * _FoamStep.w;
+    float source = max(foam.x - _Displacement[id].w, 0.0);
+    _Foam[id] = saturate(previous * foam.z + source * foam.y);
+}

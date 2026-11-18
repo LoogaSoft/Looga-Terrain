@@ -1,0 +1,183 @@
+// Looga Stamps height pass (World Aligned mode). The work texture holds one terrain tile plus a halo, in heightmap
+// texture units. One unit is twice the terrain height, so the largest terrain height is 32766 / 65535.
+#pragma kernel ClearHeights
+#pragma kernel ApplyHeightStamp
+#pragma kernel WriteHeights
+#pragma kernel AverageSeam
+#pragma kernel ApplySplinePath
+#pragma kernel CopySeam
+#pragma kernel CountChanges
+#pragma kernel ApplySnapshotLimit
+#pragma kernel ApplyWaterBed
+
+#include "../Shaders/HeightStampCore.hlsl"
+
+RWTexture2D<float> _Heights;
+int2 _HeightsSize;
+int _Halo;
+float _Resolution;
+int2 _RectOffset;
+int2 _RectSize;
+
+RWTexture2D<float> _Output;
+
+RWTexture2D<float> _SeamA;
+RWTexture2D<float> _SeamB;
+int2 _SeamStartA;
+int2 _SeamStartB;
+int2 _SeamStep;
+int _SeamLength;
+Texture2D<float> _SeamStored;
+
+Texture2D<float> _NewHeights;
+Texture2D<float> _OldHeights;
+RWStructuredBuffer<uint> _Changes;
+int _ChangeIndex;
+
+[numthreads(8, 8, 1)]
+void ClearHeights(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _HeightsSize)) return;
+    _Heights[id.xy] = 0;
+}
+
+[numthreads(8, 8, 1)]
+void ApplyHeightStamp(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _RectSize)) return;
+    int2 texel = _RectOffset + (int2)id.xy;
+    if (any(texel >= _HeightsSize)) return;
+
+    float2 tileUv = (float2(texel - _Halo) + 0.5) / _Resolution;
+    float2 stampUv = mul(_TileToStamp, float4(tileUv, 0, 1)).xy;
+    if (any(stampUv < 0) || any(stampUv > 1)) return;
+
+    FalloffInput input;
+    input.stampUv = stampUv;
+    input.stampUvDx = _TileToStamp._m00_m10 / _Resolution;
+    input.stampUvDy = _TileToStamp._m01_m11 / _Resolution;
+    input.tileUv = tileUv;
+    input.worldNoiseUv = NoiseUv(tileUv);
+    _Heights[texel] = StampHeight(_Heights[texel], input);
+}
+
+// The snapshot is a copy of the work texture, with the same size and halo.
+Texture2D<float> _Snapshot;
+
+[numthreads(8, 8, 1)]
+void ApplySnapshotLimit(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _RectSize)) return;
+    int2 texel = _RectOffset + (int2)id.xy;
+    if (any(texel >= _HeightsSize)) return;
+
+    float2 tileUv = (float2(texel - _Halo) + 0.5) / _Resolution;
+    float2 stampUv = mul(_TileToStamp, float4(tileUv, 0, 1)).xy;
+    if (any(stampUv < 0) || any(stampUv > 1)) return;
+
+    FalloffInput input;
+    input.stampUv = stampUv;
+    input.stampUvDx = _TileToStamp._m00_m10 / _Resolution;
+    input.stampUvDy = _TileToStamp._m01_m11 / _Resolution;
+    input.tileUv = tileUv;
+    input.worldNoiseUv = NoiseUv(tileUv);
+    _Heights[texel] = SnapshotLimitHeight(_Heights[texel], _Snapshot[texel], input);
+}
+
+[numthreads(8, 8, 1)]
+void ApplySplinePath(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _RectSize)) return;
+    int2 texel = _RectOffset + (int2)id.xy;
+    if (any(texel >= _HeightsSize)) return;
+
+    float2 tileUv = (float2(texel - _Halo) + 0.5) / _Resolution;
+    _Heights[texel] = PathHeight(_Heights[texel], tileUv, _Resolution);
+}
+
+[numthreads(8, 8, 1)]
+void ApplyWaterBed(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _RectSize)) return;
+    int2 texel = _RectOffset + (int2)id.xy;
+    if (any(texel >= _HeightsSize)) return;
+
+    float2 tileUv = (float2(texel - _Halo) + 0.5) / _Resolution;
+    // The falloff mask can use the bed transform. Samples outside the transform box still get the area shapes.
+    FalloffInput input;
+    input.stampUv = mul(_TileToStamp, float4(tileUv, 0, 1)).xy;
+    input.stampUvDx = _TileToStamp._m00_m10 / _Resolution;
+    input.stampUvDy = _TileToStamp._m01_m11 / _Resolution;
+    input.tileUv = tileUv;
+    input.worldNoiseUv = NoiseUv(tileUv);
+    _Heights[texel] = WaterBedHeight(_Heights[texel], input);
+}
+
+// Copies the tile interior (without the halo) to a terrain heightmap texture.
+[numthreads(8, 8, 1)]
+void WriteHeights(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _HeightsSize - 2 * _Halo)) return;
+    _Output[id.xy] = _Heights[(int2)id.xy + _Halo];
+}
+
+// Writes the mean of two shared tile edges into both edges.
+[numthreads(64, 1, 1)]
+void AverageSeam(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _SeamLength) return;
+    int2 a = _SeamStartA + _SeamStep * (int)id.x;
+    int2 b = _SeamStartB + _SeamStep * (int)id.x;
+    float height = (_SeamA[a] + _SeamB[b]) * 0.5;
+    _SeamA[a] = height;
+    _SeamB[b] = height;
+}
+
+// Copies the stored edge of a neighbor that is not evaluated again into the evaluated tile edge.
+[numthreads(64, 1, 1)]
+void CopySeam(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _SeamLength) return;
+    _SeamA[_SeamStartA + _SeamStep * (int)id.x] = _SeamStored[_SeamStartB + _SeamStep * (int)id.x];
+}
+
+// Counts the texels where the new tile heights differ from the current terrain heightmap and finds their bounds. Both
+// are 16-bit textures, so the comparison is exact. Five values for each tile: count, x min, y min, x max, y max. Each
+// thread group reduces its texels first, so only one thread of a group writes to the buffer.
+groupshared uint g_ChangeCount;
+groupshared uint g_ChangeMinX;
+groupshared uint g_ChangeMinY;
+groupshared uint g_ChangeMaxX;
+groupshared uint g_ChangeMaxY;
+
+[numthreads(8, 8, 1)]
+void CountChanges(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
+{
+    if (index == 0)
+    {
+        g_ChangeCount = 0;
+        g_ChangeMinX = 0xFFFFFFFF;
+        g_ChangeMinY = 0xFFFFFFFF;
+        g_ChangeMaxX = 0;
+        g_ChangeMaxY = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (all((int2)id.xy < _HeightsSize) && _NewHeights[id.xy] != _OldHeights[id.xy])
+    {
+        InterlockedAdd(g_ChangeCount, 1);
+        InterlockedMin(g_ChangeMinX, id.x);
+        InterlockedMin(g_ChangeMinY, id.y);
+        InterlockedMax(g_ChangeMaxX, id.x);
+        InterlockedMax(g_ChangeMaxY, id.y);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (index == 0 && g_ChangeCount > 0)
+    {
+        uint first = (uint)_ChangeIndex * 5;
+        InterlockedAdd(_Changes[first], g_ChangeCount);
+        InterlockedMin(_Changes[first + 1], g_ChangeMinX);
+        InterlockedMin(_Changes[first + 2], g_ChangeMinY);
+        InterlockedMax(_Changes[first + 3], g_ChangeMaxX);
+        InterlockedMax(_Changes[first + 4], g_ChangeMaxY);
+    }
+}

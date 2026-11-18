@@ -3,7 +3,8 @@
   "references": [
     "LoogaSoft.Terrain.Instances",
     "Unity.RenderPipelines.Universal.Runtime",
-    "LoogaSoft.Instancing"
+    "LoogaSoft.Instancing.Runtime",
+    "LoogaSoft.Lighting.Runtime"
   ],
   "includePlatforms": [
     "Editor"
@@ -14,5 +15,12 @@
   "autoReferenced": false,
   "defineConstraints": [
     "UNITY_INCLUDE_TESTS"
+  ],
+  "versionDefines": [
+    {
+      "name": "com.loogasoft.loogagraphicspro",
+      "expression": "1.4.0",
+      "define": "LOOGA_GRAPHICS_PRO"
+    }
   ]
 }

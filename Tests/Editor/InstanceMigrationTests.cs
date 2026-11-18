@@ -27,7 +27,7 @@ namespace LoogaSoft.Terrain.Tests
                 var source = GameObject.CreatePrimitive(PrimitiveType.Cube);
                 SceneManager.MoveGameObjectToScene(source, preview);
                 source.SetActive(false);
-                source.AddComponent<VegetationInteractor>();
+                source.AddComponent<VegetationInterest>();
                 var material = new Material(Shader.Find("Universal Render Pipeline/Lit"));
                 AssetDatabase.CreateAsset(material, folder + "/Material.mat");
                 var renderer = source.GetComponent<MeshRenderer>();

@@ -1,0 +1,231 @@
+// Tiling slate surface. Larger plates and tiers are real geometry in the field, so this map holds fine cleavage steps and mineral
+// grain. A crack is the step between two plates and is always connected. Tone never comes from noise clouds.
+#pragma kernel GenerateSlate
+#pragma kernel BuildSlateMaps
+
+RWTexture2D<float4> _HeightOut;
+RWTexture2D<float4> _TintOut;
+Texture2D<float4> _HeightIn;
+Texture2D<float4> _TintIn;
+RWTexture2D<float4> _AlbedoOut;
+RWTexture2D<float4> _NormalOut;
+RWTexture2D<float4> _DetailOut;
+
+int _Resolution;
+int _Seed;
+float _NormalStrength;
+float _CavityStrength;
+
+uint HashInt(uint value)
+{
+    value ^= value >> 16;
+    value *= 0x7feb352dU;
+    value ^= value >> 15;
+    value *= 0x846ca68bU;
+    value ^= value >> 16;
+    return value;
+}
+
+float Hash(int2 cell, int seed)
+{
+    return float(HashInt(uint(cell.x) + 40503u * HashInt(uint(cell.y) + 2654435769u * uint(seed))) & 0xFFFFFF) / 16777215.0;
+}
+
+int2 Wrap(int2 cell, int2 period)
+{
+    return ((cell % period) + period) % period;
+}
+
+float ValueNoise(float2 position, int2 period, int seed)
+{
+    int2 cell = int2(floor(position));
+    float2 f = position - floor(position);
+    float2 u = f * f * (3.0 - 2.0 * f);
+    float a = Hash(Wrap(cell, period), seed);
+    float b = Hash(Wrap(cell + int2(1, 0), period), seed);
+    float c = Hash(Wrap(cell + int2(0, 1), period), seed);
+    float d = Hash(Wrap(cell + int2(1, 1), period), seed);
+    return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y);
+}
+
+float Fbm2D(float2 uv, float2 frequency, int octaves, int seed)
+{
+    float sum = 0.0;
+    float weight = 0.5;
+    float total = 0.0;
+    int2 period = int2(frequency);
+    for (int octave = 0; octave < octaves; octave++)
+    {
+        sum += ValueNoise(uv * float2(period), period, seed + octave * 37) * weight;
+        total += weight;
+        weight *= 0.5;
+        period *= 2;
+    }
+    return sum / total;
+}
+
+struct Plate
+{
+    float id;
+    float otherId;
+    float edge;
+};
+
+// Nearest cell, and the true distance to the border with the next cell, in cell units.
+Plate VoronoiPlate2D(float2 uv, int2 scale, int seed)
+{
+    float2 position = uv * float2(scale);
+    int2 cell = int2(floor(position));
+    float2 f = position - floor(position);
+    int2 nearestCell = int2(0, 0);
+    int2 secondCell = int2(0, 0);
+    float2 nearest = float2(0.0, 0.0);
+    float best = 8.0;
+    float secondBest = 8.0;
+    for (int y = -1; y <= 1; y++)
+    {
+        for (int x = -1; x <= 1; x++)
+        {
+            int2 g = int2(x, y);
+            int2 wrapped = Wrap(cell + g, scale);
+            float2 r = float2(g) + float2(Hash(wrapped, seed), Hash(wrapped, seed + 1)) - f;
+            float distance = dot(r, r);
+            if (distance < best)
+            {
+                secondBest = best;
+                secondCell = nearestCell;
+                best = distance;
+                nearest = r;
+                nearestCell = g;
+            }
+            else if (distance < secondBest)
+            {
+                secondBest = distance;
+                secondCell = g;
+            }
+        }
+    }
+
+    float edge = 8.0;
+    for (int y = -2; y <= 2; y++)
+    {
+        for (int x = -2; x <= 2; x++)
+        {
+            int2 g = nearestCell + int2(x, y);
+            int2 wrapped = Wrap(cell + g, scale);
+            float2 r = float2(g) + float2(Hash(wrapped, seed), Hash(wrapped, seed + 1)) - f;
+            float2 between = r - nearest;
+            if (dot(between, between) < 1e-5) continue;
+            edge = min(edge, dot(0.5 * (nearest + r), normalize(between)));
+        }
+    }
+
+    Plate plate;
+    plate.id = Hash(Wrap(cell + nearestCell, scale), seed + 2);
+    plate.otherId = Hash(Wrap(cell + secondCell, scale), seed + 2);
+    plate.edge = edge;
+    return plate;
+}
+
+[numthreads(8, 8, 1)]
+void GenerateSlate(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= uint2(_Resolution, _Resolution))) return;
+    float2 uv = (float2(id.xy) + 0.5) / float(_Resolution);
+
+    // A sharp warp, so the plate borders are not long smooth waves.
+    float2 warp = float2(Fbm2D(uv, float2(4.0, 6.0), 3, _Seed + 7), Fbm2D(uv + 0.37, float2(4.0, 6.0), 3, _Seed + 19)) - 0.5;
+    float2 fine = float2(Fbm2D(uv, float2(22.0, 31.0), 2, _Seed + 23), Fbm2D(uv + 0.61, float2(22.0, 31.0), 2, _Seed + 29)) - 0.5;
+    float2 warped = uv + warp * 0.032 + fine * 0.008;
+
+    // Flat topped plates on two levels. Most neighbors share a level and form one calm plane, and the others meet in a sharp step.
+    Plate plateA = VoronoiPlate2D(warped, int2(4, 7), _Seed + 41);
+    float tierA = step(0.7, plateA.id);
+    float otherTierA = step(0.7, plateA.otherId);
+    float activeA = step(0.1, abs(tierA - otherTierA));
+    float rampA = smoothstep(0.0, 0.006, plateA.edge);
+    float height = lerp(0.5 * (tierA + otherTierA), tierA, rampA) * 0.10;
+
+    // Sparse flakes, only along the active borders of the plates.
+    Plate plateB = VoronoiPlate2D(warped + fine * 0.012, int2(10, 18), _Seed + 53);
+    float nearBorder = (1.0 - smoothstep(0.0, 0.09, plateA.edge)) * activeA;
+    float rampB = smoothstep(0.0, 0.009, plateB.edge);
+    float activeFlake = step(0.52, plateB.id) * nearBorder;
+    height += plateB.id * 0.05 * rampB * activeFlake;
+
+    // Smooth noise hills read as orange peel. So the grain is flat with sparse sharp pits, and small tooth only in rough patches.
+    float gritCluster = smoothstep(0.35, 0.75, Fbm2D(uv, float2(7.0, 10.0), 3, _Seed + 101));
+    gritCluster = saturate(gritCluster + (1.0 - rampA) * activeA * 0.6 + activeFlake * 0.4);
+    float microNoise = ValueNoise(uv * 640.0, int2(640, 640), _Seed + 311) * 0.35 + Hash(int2(id.xy), _Seed + 419) * 0.65;
+    height += min(0.0, microNoise - 0.36) * 0.028 + (microNoise - 0.5) * 0.008 * gritCluster;
+
+    float lipA = (1.0 - smoothstep(0.0, 0.012, plateA.edge)) * activeA;
+    float lipB = (1.0 - smoothstep(0.0, 0.016, plateB.edge)) * activeFlake;
+    float lip = saturate(lipA + lipB * 0.75);
+    float mediumGrain = ValueNoise(uv * 240.0, int2(240, 240), _Seed + 251);
+    // A small plate tone, so a flat face is stone and not a patchwork.
+    float tone = (tierA - 0.5) * 0.08 + (mediumGrain - 0.5) * 0.14;
+    float seamMask = saturate(lipA + lipB * 0.6);
+
+    _HeightOut[id.xy] = float4(height, tone, lip, gritCluster);
+    _TintOut[id.xy] = float4(seamMask, microNoise, mediumGrain, microNoise * 0.7 + mediumGrain * 0.3);
+}
+
+float HeightAt(int2 texel)
+{
+    return _HeightIn[((texel % _Resolution) + _Resolution) % _Resolution].r;
+}
+
+[numthreads(8, 8, 1)]
+void BuildSlateMaps(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= uint2(_Resolution, _Resolution))) return;
+    int2 p = int2(id.xy);
+    float4 data = _HeightIn[p];
+    float4 tint = _TintIn[p];
+    float height = data.r;
+    float gritCluster = data.a;
+
+    float dx = (HeightAt(p + int2(1, -1)) + 2.0 * HeightAt(p + int2(1, 0)) + HeightAt(p + int2(1, 1)) - HeightAt(p + int2(-1, -1)) -
+                2.0 * HeightAt(p + int2(-1, 0)) - HeightAt(p + int2(-1, 1))) * 0.125;
+    float dy = (HeightAt(p + int2(-1, 1)) + 2.0 * HeightAt(p + int2(0, 1)) + HeightAt(p + int2(1, 1)) - HeightAt(p + int2(-1, -1)) -
+                2.0 * HeightAt(p + int2(0, -1)) - HeightAt(p + int2(1, -1))) * 0.125;
+    float3 normal = normalize(float3(-dx * _NormalStrength * float(_Resolution) * 0.1, -dy * _NormalStrength * float(_Resolution) * 0.1, 1.0));
+
+    float around = 0.0;
+    for (int y = -4; y <= 4; y += 2)
+    {
+        for (int x = -4; x <= 4; x += 2)
+        {
+            around += HeightAt(p + int2(x, y));
+        }
+    }
+    around /= 25.0;
+    float cavity = saturate(1.0 - max(around - height, 0.0) * _CavityStrength);
+
+    const float3 deepCharcoal = float3(0.13, 0.125, 0.115);
+    const float3 baseSlate = float3(0.285, 0.275, 0.235);
+    const float3 warmSlate = float3(0.345, 0.330, 0.275);
+    const float3 rustCrevice = float3(0.380, 0.305, 0.215);
+    const float3 mineralFleck = float3(0.550, 0.525, 0.475);
+
+    float3 color = lerp(deepCharcoal, baseSlate, saturate(cavity * 0.85 + 0.15));
+    color = lerp(color, warmSlate, saturate(0.5 + data.g));
+
+    // Cracks are darker than the stone, with some iron oxide. A pale crack reads as a painted line.
+    float creviceOxide = saturate(tint.r * 0.65 + (1.0 - cavity) * 0.55);
+    color = lerp(color, rustCrevice * 0.55, creviceOxide * 0.55);
+
+    // Dark and pale mineral grains at pixel scale.
+    float darkGrain = smoothstep(0.30, 0.14, tint.a);
+    float paleFleck = smoothstep(0.64, 0.80, tint.g) * lerp(0.35, 1.0, gritCluster);
+    color = lerp(color, deepCharcoal, darkGrain * 0.26);
+    color = lerp(color, mineralFleck, paleFleck * 0.68);
+
+    float rough = max(gritCluster * 0.80, step(0.5, 1.0 - cavity));
+    float smoothness = lerp(0.32, 0.10, rough);
+
+    _AlbedoOut[id.xy] = float4(saturate(color), smoothness);
+    _NormalOut[id.xy] = float4(normal.xy * 0.5 + 0.5, saturate(height * 1.6 + 0.3), cavity);
+    _DetailOut[id.xy] = float4(data.b, gritCluster, 0.0, 1.0);
+}

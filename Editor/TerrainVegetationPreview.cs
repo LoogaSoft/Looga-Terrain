@@ -2,27 +2,43 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using LoogaSoft.Instancing;
 using LoogaSoft.Terrain.Instances;
 using UnityEditor;
 using UnityEditor.Build;
 using UnityEditor.Build.Reporting;
+using UnityEditor.EditorTools;
 using UnityEditor.SceneManagement;
+using UnityEditor.TerrainTools;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 using Object = UnityEngine.Object;
 
 namespace LoogaSoft.Terrain.Editor
 {
-    /// <summary>Streams full-quality vegetation around Scene view cameras without changing runtime observers.</summary>
+    /// <summary>
+    /// Streams full-quality vegetation around Scene view cameras and game cameras with a vegetation interest, without
+    /// changing runtime observers.
+    /// </summary>
     [InitializeOnLoad]
     public static class TerrainVegetationPreview
     {
         private static readonly List<TerrainVegetationProvider> Providers = new();
+        private static readonly HashSet<TerrainVegetationProvider> SelectedProviders = new();
         private static readonly Stopwatch Watch = new();
+        // Reused each tick, so that the preview makes no garbage between discoveries.
+        private static readonly List<Transform> ObserverList = new();
         private static LoogaWorldController[] _controllers = Array.Empty<LoogaWorldController>();
+        private static VegetationInterest[] _interests = Array.Empty<VegetationInterest>();
         private static Transform[] _observers = Array.Empty<Transform>();
         private static double[] _priorities = Array.Empty<double>();
         private static readonly Dictionary<TerrainVegetationProvider, double> LastUpdate = new();
+        // Dirty count of each terrain data at the last tick. An undo that changes it reloads the vegetation data.
+        private static readonly Dictionary<TerrainData, int> DataVersions = new();
+        // Native foliage visibility of the terrains that the previous script domain kept hidden, by terrain instance ID.
+        // Their providers take it when the preview starts them again.
+        private static readonly Dictionary<int, bool> HiddenFoliage = new();
+        private const string HiddenFoliageKey = "LoogaSoft.Terrain.VegetationPreview.HiddenFoliage";
         private const double NearLimit = 1e6;
         private static double _nextDiscovery;
         private static double _nextUpdate;
@@ -38,7 +54,8 @@ namespace LoogaSoft.Terrain.Editor
             EditorApplication.hierarchyChanged += RequestDiscovery;
             EditorApplication.playModeStateChanged += OnPlayModeChanged;
             EditorApplication.quitting += Stop;
-            AssemblyReloadEvents.beforeAssemblyReload += Stop;
+            AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
+            LoadHiddenFoliage();
             EditorSceneManager.sceneSaving += OnSceneSaving;
             EditorSceneManager.sceneSaved += OnSceneSaved;
             EditorSceneManager.sceneClosing += OnSceneClosing;
@@ -86,7 +103,7 @@ namespace LoogaSoft.Terrain.Editor
                 EditorGUILayout.LabelField(GetStatus(controller), EditorStyles.wordWrappedMiniLabel);
                 if (enabled)
                 {
-                    EditorGUILayout.LabelField("Full authored quality. Terrain selection temporarily restores native authoring.",
+                    EditorGUILayout.LabelField("Full authored quality. A terrain paint tool uses native rendering on the selected terrain.",
                         EditorStyles.wordWrappedMiniLabel);
                 }
             }
@@ -99,6 +116,15 @@ namespace LoogaSoft.Terrain.Editor
 
         private static void Update()
         {
+            // An undo compares the terrain data with these versions. Stamp writes between two undo steps then do not
+            // count as a change by the undo.
+            foreach (TerrainVegetationProvider provider in Providers)
+            {
+                if (provider)
+                {
+                    RecordDataVersion(provider);
+                }
+            }
             try
             {
                 UpdatePreview();
@@ -115,15 +141,28 @@ namespace LoogaSoft.Terrain.Editor
         private static void UpdatePreview()
         {
             double now = EditorApplication.timeSinceStartup;
-            if (EditorApplication.isPlayingOrWillChangePlaymode || EditorApplication.isCompiling || _saving || _building)
+            if (_saving)
+            {
+                // A scene save runs inside one editor call, so a tick sees this flag only after a failed save.
+                _saving = false;
+                ReclaimNativeFoliage();
+            }
+            if (EditorApplication.isPlayingOrWillChangePlaymode || _building)
             {
                 _pauseReason = "Preview paused during editor transition";
                 Stop();
                 return;
             }
+            // Scripts compile in the background. The loaded vegetation stays and the streams wait: a stop gave all
+            // terrains to native foliage, which made the editor slow during each compilation.
+            if (EditorApplication.isCompiling)
+            {
+                _pauseReason = "Preview paused while scripts compile";
+                return;
+            }
             if (now < _resumeAfter || now < _nextUpdate) return;
             _nextUpdate = now + 0.03;
-            if (_controllers.Any(c => !c || !c.isActiveAndEnabled || !c.RenderVegetation || !c.PreviewVegetationInEditor))
+            if (AnyControllerStopped())
             {
                 Stop();
                 RequestDiscovery();
@@ -133,22 +172,30 @@ namespace LoogaSoft.Terrain.Editor
             {
                 _controllers = Object.FindObjectsByType<LoogaWorldController>(FindObjectsSortMode.None)
                     .Where(c => c.isActiveAndEnabled && c.RenderVegetation && c.PreviewVegetationInEditor).ToArray();
+                _interests = Object.FindObjectsByType<VegetationInterest>(FindObjectsSortMode.None);
                 _nextDiscovery = now + 1;
             }
-            GameObject selected = Selection.activeGameObject;
-            if ((selected && selected.GetComponent<UnityEngine.Terrain>()) || Selection.activeObject is TerrainData)
-            {
-                _pauseReason = "Native preview while editing terrain";
-                Stop();
-                return;
-            }
             _pauseReason = null;
-            var observers = new List<Transform>();
-            foreach (SceneView view in SceneView.sceneViews)
+            List<Transform> observers = ObserverList;
+            observers.Clear();
+            // An index loop: a foreach over the ArrayList allocates its enumerator.
+            for (int i = 0; i < SceneView.sceneViews.Count; i++)
             {
+                var view = (SceneView)SceneView.sceneViews[i];
                 if (view && view.camera && !view.in2DMode)
                 {
                     observers.Add(view.camera.transform);
+                }
+            }
+            // Game cameras with a vegetation interest also observe. Without them, the Game view shows vegetation only
+            // near a Scene view camera, and after a script reload a hidden Scene view keeps its camera at the world
+            // origin until that view draws again.
+            foreach (VegetationInterest interest in _interests)
+            {
+                if (interest && interest.isActiveAndEnabled && interest.TryGetComponent(out Camera camera) &&
+                    camera.isActiveAndEnabled)
+                {
+                    observers.Add(interest.transform);
                 }
             }
             if (_controllers.Length == 0 || observers.Count == 0)
@@ -171,17 +218,23 @@ namespace LoogaSoft.Terrain.Editor
             }
             // Stream while the camera moves. Terrains within detail range of a Scene view camera use the
             // tick budget first, least recently updated first, so no nearby terrain starves.
+            bool repaint = ReleaseSelectedTerrains();
             SortByPriority(now);
-            bool repaint = false;
             Watch.Restart();
             foreach (TerrainVegetationProvider provider in Providers)
             {
-                if (!provider || !provider.isActiveAndEnabled) continue;
+                // While play mode ends, a tick can still see the providers of the play mode scene. They keep their
+                // runtime observers and go away in the same transition.
+                if (!provider || !provider.isActiveAndEnabled || SelectedProviders.Contains(provider) ||
+                    Application.IsPlaying(provider)) continue;
                 bool ready = provider.IsRendering;
                 int count = provider.InstanceCount;
                 provider.BeginEditorPreview(_observers);
+                // After the start, because a start releases the terrain.
+                AdoptHiddenFoliage(provider);
                 provider.ProcessChanges();
                 LastUpdate[provider] = now;
+                RecordDataVersion(provider);
                 repaint |= ready != provider.IsRendering || count != provider.InstanceCount;
                 if (Watch.Elapsed.TotalMilliseconds >= 8) break;
             }
@@ -190,6 +243,38 @@ namespace LoogaSoft.Terrain.Editor
             {
                 SceneView.RepaintAll();
             }
+        }
+
+        // Native terrain paint tools need native foliage on the terrain that the user edits.
+        // A selection alone keeps the preview. Native foliage on one dense terrain can cost about 0.7 s per frame.
+        private static bool ReleaseSelectedTerrains()
+        {
+            SelectedProviders.Clear();
+            Type tool = ToolManager.activeToolType;
+            if (tool == null || !typeof(TerrainPaintToolWithOverlaysBase).IsAssignableFrom(tool)) return false;
+            bool released = false;
+            foreach (TerrainVegetationProvider provider in Providers)
+            {
+                if (!provider) continue;
+                var terrain = provider.GetComponent<UnityEngine.Terrain>();
+                bool selected = terrain && (Selection.Contains(terrain.gameObject)
+                    || (Selection.activeObject is TerrainData data && terrain.terrainData == data));
+                if (!selected) continue;
+                SelectedProviders.Add(provider);
+                released |= provider.IsRendering;
+                provider.EndEditorPreview();
+            }
+            return released;
+        }
+
+        private static bool AnyControllerStopped()
+        {
+            foreach (LoogaWorldController controller in _controllers)
+            {
+                if (!controller || !controller.isActiveAndEnabled || !controller.RenderVegetation ||
+                    !controller.PreviewVegetationInEditor) return true;
+            }
+            return false;
         }
 
         private static void SortByPriority(double now)
@@ -274,6 +359,7 @@ namespace LoogaSoft.Terrain.Editor
                 Providers.RemoveAt(i);
             }
             Providers.AddRange(desired);
+            RestoreHiddenFoliage(false);
         }
 
         /// <summary>Releases all temporary renderer ownership and restores native foliage visibility.</summary>
@@ -284,8 +370,73 @@ namespace LoogaSoft.Terrain.Editor
                 if (provider) provider.EndEditorPreview();
             }
             Providers.Clear();
+            SelectedProviders.Clear();
             _observers = Array.Empty<Transform>();
             LastUpdate.Clear();
+            RestoreHiddenFoliage(true);
+        }
+
+        // Keeps native foliage hidden on the terrains that Looga draws, and stores their visibility for the next script
+        // domain. Native foliage on all terrains made the editor slow for seconds after each script reload.
+        private static void OnBeforeAssemblyReload()
+        {
+            var values = new List<int>();
+            foreach (TerrainVegetationProvider provider in Providers)
+            {
+                if (provider && provider.EndEditorPreviewForReload(out bool nativeState))
+                {
+                    values.Add(provider.GetComponent<UnityEngine.Terrain>().GetInstanceID());
+                    values.Add(nativeState ? 1 : 0);
+                }
+            }
+            // Terrains that this domain did not give back yet stay hidden too.
+            foreach (KeyValuePair<int, bool> hidden in HiddenFoliage)
+            {
+                values.Add(hidden.Key);
+                values.Add(hidden.Value ? 1 : 0);
+            }
+            HiddenFoliage.Clear();
+            SessionState.SetIntArray(HiddenFoliageKey, values.ToArray());
+            Stop();
+        }
+
+        private static void LoadHiddenFoliage()
+        {
+            int[] values = SessionState.GetIntArray(HiddenFoliageKey, Array.Empty<int>());
+            SessionState.EraseIntArray(HiddenFoliageKey);
+            for (int i = 0; i + 1 < values.Length; i += 2)
+            {
+                HiddenFoliage[values[i]] = values[i + 1] != 0;
+            }
+        }
+
+        private static void AdoptHiddenFoliage(TerrainVegetationProvider provider)
+        {
+            if (HiddenFoliage.Count == 0) return;
+            var terrain = provider.GetComponent<UnityEngine.Terrain>();
+            if (terrain && HiddenFoliage.Remove(terrain.GetInstanceID(), out bool nativeState))
+            {
+                provider.AdoptHiddenNativeFoliage(nativeState);
+            }
+        }
+
+        // Restores native foliage on hidden terrains that no provider takes: all of them, or those without a preview
+        // provider.
+        private static void RestoreHiddenFoliage(bool all)
+        {
+            if (HiddenFoliage.Count == 0) return;
+            foreach (UnityEngine.Terrain terrain in Object.FindObjectsByType<UnityEngine.Terrain>(FindObjectsSortMode.None))
+            {
+                if (!HiddenFoliage.TryGetValue(terrain.GetInstanceID(), out bool nativeState)) continue;
+                if (!all && terrain.TryGetComponent(out TerrainVegetationProvider provider) &&
+                    Providers.Contains(provider)) continue;
+                terrain.drawTreesAndFoliage = nativeState;
+                HiddenFoliage.Remove(terrain.GetInstanceID());
+            }
+            if (all)
+            {
+                HiddenFoliage.Clear();
+            }
         }
 
         /// <summary>Restores native foliage visibility before a player build serializes open scenes.</summary>
@@ -309,17 +460,64 @@ namespace LoogaSoft.Terrain.Editor
             RequestDiscovery();
         }
 
+        // The scene file keeps the native foliage visibility. The loaded vegetation stays: a full stop gave the terrains
+        // to native foliage until the streams loaded again, which took about 10 s of 0.7-2 s editor frames.
         private static void OnSceneSaving(Scene scene, string path)
         {
             _saving = true;
-            Stop();
+            foreach (TerrainVegetationProvider provider in Providers)
+            {
+                if (provider && provider.gameObject.scene == scene)
+                {
+                    provider.RestoreNativeFoliage();
+                }
+            }
+            // After a script reload, a terrain stays hidden until its provider takes it. A save in that time wrote the
+            // hidden state into the scene. On the next load, the provider then did not take the terrain.
+            SetHiddenFoliage(scene, true);
         }
 
         private static void OnSceneSaved(Scene scene)
         {
             _saving = false;
-            _resumeAfter = EditorApplication.timeSinceStartup + 0.1;
+            ReclaimNativeFoliage();
             RequestDiscovery();
+        }
+
+        private static void ReclaimNativeFoliage()
+        {
+            foreach (TerrainVegetationProvider provider in Providers)
+            {
+                if (provider)
+                {
+                    provider.ReclaimNativeFoliage();
+                }
+            }
+            SetHiddenFoliage(default, false);
+        }
+
+        // Writes the stored visibility to the hidden terrains of a scene that no provider took yet, or hides them again.
+        // A default scene selects the terrains of all scenes.
+        private static void SetHiddenFoliage(Scene scene, bool restore)
+        {
+            if (HiddenFoliage.Count == 0) return;
+            foreach (UnityEngine.Terrain terrain in Object.FindObjectsByType<UnityEngine.Terrain>(FindObjectsSortMode.None))
+            {
+                if (scene.IsValid() && terrain.gameObject.scene != scene) continue;
+                if (HiddenFoliage.TryGetValue(terrain.GetInstanceID(), out bool nativeState))
+                {
+                    terrain.drawTreesAndFoliage = restore && nativeState;
+                }
+            }
+        }
+
+        private static void RecordDataVersion(TerrainVegetationProvider provider)
+        {
+            var terrain = provider.GetComponent<UnityEngine.Terrain>();
+            if (terrain && terrain.terrainData)
+            {
+                DataVersions[terrain.terrainData] = EditorUtility.GetDirtyCount(terrain.terrainData);
+            }
         }
 
         private static void OnSceneClosing(Scene scene, bool removingScene)
@@ -328,9 +526,27 @@ namespace LoogaSoft.Terrain.Editor
             RequestDiscovery();
         }
 
+        // An undo keeps the loaded vegetation. The providers find terrain, density and prototype changes themselves. An
+        // undo can also restore an older terrain state with native foliage visible, or older detail and tree data. The
+        // versions are from the last editor tick, so only terrain data that the undo itself changed loads again.
         private static void OnUndo()
         {
-            Stop();
+            foreach (TerrainVegetationProvider provider in Providers)
+            {
+                if (!provider) continue;
+                provider.ReclaimNativeFoliage();
+                var terrain = provider.GetComponent<UnityEngine.Terrain>();
+                TerrainData data = terrain ? terrain.terrainData : null;
+                if (!data || !DataVersions.TryGetValue(data, out int version) ||
+                    version == EditorUtility.GetDirtyCount(data)) continue;
+                // Detail patches load again while Looga draws the old ones. Trees load again in full.
+                provider.InvalidateDetails(new RectInt(0, 0, data.detailWidth, data.detailHeight));
+                if (data.treeInstanceCount > 0)
+                {
+                    provider.InvalidateTrees();
+                }
+                DataVersions[data] = EditorUtility.GetDirtyCount(data);
+            }
             RequestDiscovery();
         }
     }

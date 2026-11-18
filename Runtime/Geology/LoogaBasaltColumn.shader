@@ -188,22 +188,34 @@ Shader "Looga/Basalt Column"
             return normalize(lerp(primary, secondary, secondaryWeight));
         }
 
-        float SampleTriplanarCrackLayer(float3 pillarPosition, half3 surfaceNormal,
-            float tiling, float2 phase)
+        // Mip level of the crack map at a pillar position for the base crack tiling. It comes from the screen
+        // derivatives before any loop: inside the parallax loop the derivatives are undefined.
+        float CrackLod(float3 pillarPosition)
         {
+            float3 positionDx = ddx(pillarPosition);
+            float3 positionDy = ddy(pillarPosition);
+            float texels = max(length(positionDx), length(positionDy)) * _CrackTiling *
+                _CrackHeightMap_TexelSize.z;
+            return max(0.0, log2(max(texels, 0.000001)));
+        }
+
+        float SampleTriplanarCrackLayer(float3 pillarPosition, half3 surfaceNormal,
+            float tiling, float2 phase, float crackLod)
+        {
+            float lod = crackLod + log2(max(tiling / max(_CrackTiling, 0.000001), 0.000001));
             float3 weights = TriplanarWeights(surfaceNormal);
             float2 uvX = RotateUv(pillarPosition.zy * tiling, float2(0.8, 0.6)) + phase;
             float2 uvY = RotateUv(pillarPosition.xz * tiling, float2(0.6, -0.8)) +
                 phase.yx * float2(-1.0, 1.0);
             float2 uvZ = RotateUv(pillarPosition.xy * tiling, float2(-0.8, 0.6)) -
                 phase * 0.73;
-            float heightX = SAMPLE_TEXTURE2D(_CrackHeightMap, sampler_CrackHeightMap, uvX).r;
-            float heightY = SAMPLE_TEXTURE2D(_CrackHeightMap, sampler_CrackHeightMap, uvY).r;
-            float heightZ = SAMPLE_TEXTURE2D(_CrackHeightMap, sampler_CrackHeightMap, uvZ).r;
+            float heightX = SAMPLE_TEXTURE2D_LOD(_CrackHeightMap, sampler_CrackHeightMap, uvX, lod).r;
+            float heightY = SAMPLE_TEXTURE2D_LOD(_CrackHeightMap, sampler_CrackHeightMap, uvY, lod).r;
+            float heightZ = SAMPLE_TEXTURE2D_LOD(_CrackHeightMap, sampler_CrackHeightMap, uvZ, lod).r;
             return dot(float3(heightX, heightY, heightZ), weights);
         }
 
-        float EvaluateCrackMask(float3 pillarPosition, half3 surfaceNormal, float pillarSeed)
+        float EvaluateCrackMask(float3 pillarPosition, half3 surfaceNormal, float pillarSeed, float crackLod)
         {
             // Work in pillar-local metric space. The phase changes for every transform so each
             // pillar receives its own crack layout without changing the physical crack scale.
@@ -220,10 +232,10 @@ Shader "Looga/Basalt Column"
                 ValueNoise(crackPosition * _CrackPatchScale * 1.73 + 177.3)) - 0.5;
             float primaryHeight = SampleTriplanarCrackLayer(
                 crackPosition + primaryWarp * _CrackWarpStrength,
-                surfaceNormal, _CrackTiling, float2(0.0, 0.0));
+                surfaceNormal, _CrackTiling, float2(0.0, 0.0), crackLod);
             float secondaryHeight = SampleTriplanarCrackLayer(
                 crackPosition + secondaryWarp * _CrackWarpStrength * 0.83, surfaceNormal,
-                _CrackTiling * _CrackSecondaryScale, float2(13.71, -5.29));
+                _CrackTiling * _CrackSecondaryScale, float2(13.71, -5.29), crackLod);
             float primaryCrack = saturate((0.64 - primaryHeight) * 2.8);
             float secondaryCrack = saturate((0.62 - secondaryHeight) * 4.1);
 
@@ -255,11 +267,11 @@ Shader "Looga/Basalt Column"
         }
 
         void EvaluateParallaxCracks(float3 pillarPosition, half3 surfaceNormal,
-            half3 viewDirection, float pillarSeed, float cameraDistance,
+            half3 viewDirection, float pillarSeed, float cameraDistance, float crackLod,
             out float crackMask, out half3 crackNormal)
         {
             float distantCrack = EvaluateCrackMask(
-                pillarPosition, surfaceNormal, pillarSeed) * _FarCrackStrength;
+                pillarPosition, surfaceNormal, pillarSeed, crackLod) * _FarCrackStrength;
             crackMask = distantCrack;
             crackNormal = surfaceNormal;
 
@@ -278,7 +290,7 @@ Shader "Looga/Basalt Column"
             float layerDepth = 0.0;
             float3 samplePosition = pillarPosition;
             float height = 1.0 - EvaluateCrackMask(
-                samplePosition, surfaceNormal, pillarSeed);
+                samplePosition, surfaceNormal, pillarSeed, crackLod);
             UNITY_LOOP
             for (int stepIndex = 0; stepIndex < 24; stepIndex++)
             {
@@ -286,7 +298,7 @@ Shader "Looga/Basalt Column"
                 samplePosition -= positionStep;
                 layerDepth += layerStep;
                 height = 1.0 - EvaluateCrackMask(
-                    samplePosition, surfaceNormal, pillarSeed);
+                    samplePosition, surfaceNormal, pillarSeed, crackLod);
             }
 
             float parallaxCrack = saturate(1.0 - height);
@@ -298,13 +310,13 @@ Shader "Looga/Basalt Column"
             float sampleDistance = max(0.12,
                 rcp(max(_CrackTiling * _CrackHeightMap_TexelSize.z, 1.0)));
             float left = EvaluateCrackMask(
-                samplePosition - tangent * sampleDistance, surfaceNormal, pillarSeed);
+                samplePosition - tangent * sampleDistance, surfaceNormal, pillarSeed, crackLod);
             float right = EvaluateCrackMask(
-                samplePosition + tangent * sampleDistance, surfaceNormal, pillarSeed);
+                samplePosition + tangent * sampleDistance, surfaceNormal, pillarSeed, crackLod);
             float down = EvaluateCrackMask(
-                samplePosition - bitangent * sampleDistance, surfaceNormal, pillarSeed);
+                samplePosition - bitangent * sampleDistance, surfaceNormal, pillarSeed, crackLod);
             float up = EvaluateCrackMask(
-                samplePosition + bitangent * sampleDistance, surfaceNormal, pillarSeed);
+                samplePosition + bitangent * sampleDistance, surfaceNormal, pillarSeed, crackLod);
             float2 gradient = float2(right - left, up - down) / sampleDistance;
             half3 parallaxNormal = normalize(surfaceNormal -
                 tangent * gradient.x * _ParallaxNormalStrength -
@@ -378,8 +390,9 @@ Shader "Looga/Basalt Column"
             float3 pillarPosition = input.pillarPositionAndSeed.xyz;
             float pillarSeed = input.pillarPositionAndSeed.w;
             half3 crackSurfaceNormal = normalize(input.normalOS);
+            float crackLod = CrackLod(pillarPosition);
             float parallaxCrack = EvaluateCrackMask(
-                pillarPosition, crackSurfaceNormal, pillarSeed) *
+                pillarPosition, crackSurfaceNormal, pillarSeed, crackLod) *
                 _FarCrackStrength;
 #if defined(_PARALLAX_CRACKS)
             float4x4 objectToWorld = GetObjectToWorldMatrix();
@@ -391,7 +404,7 @@ Shader "Looga/Basalt Column"
                 objectScale);
             half3 parallaxNormalOS;
             EvaluateParallaxCracks(pillarPosition, crackSurfaceNormal, viewDirectionOS,
-                pillarSeed, distance(_WorldSpaceCameraPos, input.positionWS),
+                pillarSeed, distance(_WorldSpaceCameraPos, input.positionWS), crackLod,
                 parallaxCrack, parallaxNormalOS);
             half3 parallaxNormalWS = TransformObjectToWorldNormal(parallaxNormalOS);
             normal = normalize(lerp(normal, parallaxNormalWS, parallaxCrack));

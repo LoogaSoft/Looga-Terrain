@@ -1,0 +1,169 @@
+// Looga Stamps texture kernels: the edge copy between tiles and the conversion of layer and weight maps into terrain
+// alphamaps. Layer maps hold layer index / 32 in each channel, weight maps the matching weights.
+
+#pragma kernel CopyEdge
+#pragma kernel WriteAlphamaps
+#pragma kernel WriteAlphamap
+#pragma kernel CountAlphamapChanges
+
+#define LAYER_INDEX_SCALE 32.0
+#define MAXIMUM_ALPHAMAPS 8
+
+// Edge copy. Side: 0 left, 1 right, 2 top (+z), 3 bottom (-z). Width and height are the last texel indices of the
+// tile. A neighbor with another resolution maps by the position along the edge.
+RWTexture2D<float4> _TileLayers;
+RWTexture2D<float4> _TileWeights;
+Texture2D<float4> _NeighborLayers;
+Texture2D<float4> _NeighborWeights;
+// Neighbor layer index to tile layer index (-1 when the tile does not have the layer).
+StructuredBuffer<float> _LayerRemap;
+int _Side;
+int _Width;
+int _Height;
+
+float4 RemapLayers(float4 layers)
+{
+    uint4 index = (uint4)round(layers * LAYER_INDEX_SCALE);
+    float4 remapped = float4(_LayerRemap[index.x], _LayerRemap[index.y], _LayerRemap[index.z], _LayerRemap[index.w]);
+    return remapped / LAYER_INDEX_SCALE;
+}
+
+[numthreads(64, 1, 1)]
+void CopyEdge(uint3 id : SV_DispatchThreadID)
+{
+    uint neighborWidth, neighborHeight;
+    _NeighborLayers.GetDimensions(neighborWidth, neighborHeight);
+    int2 target;
+    int2 source;
+    if (_Side <= 1)
+    {
+        if ((int)id.x > _Height) return;
+        int row = (int)round(id.x * (neighborHeight - 1) / (float)max(_Height, 1));
+        target = int2(_Side == 0 ? 0 : _Width, id.x);
+        source = int2(_Side == 0 ? (int)neighborWidth - 1 : 0, row);
+    }
+    else
+    {
+        if ((int)id.x > _Width) return;
+        int column = (int)round(id.x * (neighborWidth - 1) / (float)max(_Width, 1));
+        target = int2(id.x, _Side == 2 ? _Height : 0);
+        source = int2(column, _Side == 2 ? 0 : (int)neighborHeight - 1);
+    }
+    _TileLayers[target] = RemapLayers(_NeighborLayers[source]);
+    _TileWeights[target] = _NeighborWeights[source];
+}
+
+// Alphamap output. Weights are divided by their sum. A texel without weight gets layer 0 at 0.25, like MicroVerse.
+Texture2D<float4> _LayerMap;
+Texture2D<float4> _WeightMap;
+RWTexture2D<float4> _Alphamap0;
+RWTexture2D<float4> _Alphamap1;
+RWTexture2D<float4> _Alphamap2;
+RWTexture2D<float4> _Alphamap3;
+RWTexture2D<float4> _Alphamap4;
+RWTexture2D<float4> _Alphamap5;
+RWTexture2D<float4> _Alphamap6;
+RWTexture2D<float4> _Alphamap7;
+int _AlphamapCount;
+int2 _AlphamapSize;
+// WriteAlphamap only: the alphamap that _Alphamap0 receives.
+int _AlphamapIndex;
+
+// Layer weights of one texel, for all alphamap channels.
+void LayerChannels(uint2 texel, out float channels[MAXIMUM_ALPHAMAPS * 4])
+{
+    int4 layers = (int4)round(_LayerMap[texel] * LAYER_INDEX_SCALE);
+    float4 weights = _WeightMap[texel];
+    float total = weights.x + weights.y + weights.z + weights.w;
+    if (total <= 0)
+    {
+        weights = float4(0.25, 0, 0, 0);
+    }
+    else
+    {
+        weights /= total;
+    }
+
+    for (int i = 0; i < MAXIMUM_ALPHAMAPS * 4; i++)
+    {
+        channels[i] = 0;
+    }
+    channels[layers.x] += weights.x;
+    channels[layers.y] += weights.y;
+    channels[layers.z] += weights.z;
+    channels[layers.w] += weights.w;
+}
+
+[numthreads(8, 8, 1)]
+void WriteAlphamaps(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _AlphamapSize.x || (int)id.y >= _AlphamapSize.y) return;
+    float channels[MAXIMUM_ALPHAMAPS * 4];
+    LayerChannels(id.xy, channels);
+    _Alphamap0[id.xy] = float4(channels[0], channels[1], channels[2], channels[3]);
+    if (_AlphamapCount > 1) _Alphamap1[id.xy] = float4(channels[4], channels[5], channels[6], channels[7]);
+    if (_AlphamapCount > 2) _Alphamap2[id.xy] = float4(channels[8], channels[9], channels[10], channels[11]);
+    if (_AlphamapCount > 3) _Alphamap3[id.xy] = float4(channels[12], channels[13], channels[14], channels[15]);
+    if (_AlphamapCount > 4) _Alphamap4[id.xy] = float4(channels[16], channels[17], channels[18], channels[19]);
+    if (_AlphamapCount > 5) _Alphamap5[id.xy] = float4(channels[20], channels[21], channels[22], channels[23]);
+    if (_AlphamapCount > 6) _Alphamap6[id.xy] = float4(channels[24], channels[25], channels[26], channels[27]);
+    if (_AlphamapCount > 7) _Alphamap7[id.xy] = float4(channels[28], channels[29], channels[30], channels[31]);
+}
+
+// One alphamap into _Alphamap0, so that a single texture can stage each alphamap in turn.
+[numthreads(8, 8, 1)]
+void WriteAlphamap(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _AlphamapSize.x || (int)id.y >= _AlphamapSize.y) return;
+    float channels[MAXIMUM_ALPHAMAPS * 4];
+    LayerChannels(id.xy, channels);
+    int first = _AlphamapIndex * 4;
+    _Alphamap0[id.xy] = float4(channels[first], channels[first + 1], channels[first + 2], channels[first + 3]);
+}
+
+// Counts the texels where an evaluated alphamap differs from the current terrain alphamap and finds their bounds. Both
+// are 8-bit textures, so the comparison is exact. Five values for each tile: count, x min, y min, x max, y max. Each
+// thread group reduces its texels first, so only one thread of a group writes to the buffer.
+Texture2D<float4> _NewAlphamap;
+Texture2D<float4> _OldAlphamap;
+RWStructuredBuffer<uint> _AlphamapChanges;
+int2 _AlphamapCheckSize;
+int _AlphamapCheckIndex;
+
+groupshared uint g_AlphamapCount;
+groupshared uint g_AlphamapMinX;
+groupshared uint g_AlphamapMinY;
+groupshared uint g_AlphamapMaxX;
+groupshared uint g_AlphamapMaxY;
+
+[numthreads(8, 8, 1)]
+void CountAlphamapChanges(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
+{
+    if (index == 0)
+    {
+        g_AlphamapCount = 0;
+        g_AlphamapMinX = 0xFFFFFFFF;
+        g_AlphamapMinY = 0xFFFFFFFF;
+        g_AlphamapMaxX = 0;
+        g_AlphamapMaxY = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (all((int2)id.xy < _AlphamapCheckSize) && any(_NewAlphamap[id.xy] != _OldAlphamap[id.xy]))
+    {
+        InterlockedAdd(g_AlphamapCount, 1);
+        InterlockedMin(g_AlphamapMinX, id.x);
+        InterlockedMin(g_AlphamapMinY, id.y);
+        InterlockedMax(g_AlphamapMaxX, id.x);
+        InterlockedMax(g_AlphamapMaxY, id.y);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (index == 0 && g_AlphamapCount > 0)
+    {
+        uint first = (uint)_AlphamapCheckIndex * 5;
+        InterlockedAdd(_AlphamapChanges[first], g_AlphamapCount);
+        InterlockedMin(_AlphamapChanges[first + 1], g_AlphamapMinX);
+        InterlockedMin(_AlphamapChanges[first + 2], g_AlphamapMinY);
+        InterlockedMax(_AlphamapChanges[first + 3], g_AlphamapMaxX);
+        InterlockedMax(_AlphamapChanges[first + 4], g_AlphamapMaxY);
+    }
+}

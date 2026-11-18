@@ -42,6 +42,9 @@ namespace LoogaSoft.Terrain.Instances
         private readonly UnityEngine.Terrain _terrain;
         private readonly TerrainData _data;
         private readonly ComputeShader _shader;
+        // GPU sampler: gives the GPU time of the detail placement.
+        private static readonly UnityEngine.Profiling.CustomSampler PlacementGpuSample =
+            UnityEngine.Profiling.CustomSampler.Create("Looga Detail Placement", true);
         private readonly int _kernel;
         private readonly float[] _multipliers;
         private readonly uint[] _seeds;
@@ -60,11 +63,17 @@ namespace LoogaSoft.Terrain.Instances
         /// <summary>Placements queued since the last Clear. Each placement is one output transform.</summary>
         internal int PendingPlacements { get; private set; }
 
+        /// <summary>Pages queued since the last Clear.</summary>
+        internal int PageCount => _pages.Count;
+
         /// <summary>Output of the last Dispatch. InstanceRenderer.WriteRanges reads it.</summary>
         internal GraphicsBuffer Placements => _placements;
 
-        /// <summary>Largest axis scale of any placement. Instance ranges use it as their reach.</summary>
-        internal float MaximumScale { get; }
+        /// <summary>
+        /// Largest distance from a page to an instance bound: the largest axis scale of any placement and one detail
+        /// texel, because an instance lands up to one texel past its own texel. Instance ranges use it as their reach.
+        /// </summary>
+        internal float Reach { get; }
 
         internal GpuDetailGenerator(UnityEngine.Terrain terrain)
         {
@@ -93,8 +102,10 @@ namespace LoogaSoft.Terrain.Instances
                     HolePadding = Mathf.Max(0, prototype.holeEdgePadding),
                     Alignment = prototype.alignToGround
                 };
-                MaximumScale = Mathf.Max(MaximumScale, prototype.maxWidth, prototype.maxHeight);
+                Reach = Mathf.Max(Reach, prototype.maxWidth, prototype.maxHeight);
             }
+            Vector3 size = _data.size;
+            Reach += Mathf.Max(size.x, size.z) / Mathf.Max(1, _data.detailWidth);
             _layers = new GraphicsBuffer(GraphicsBuffer.Target.Structured, layers.Length, 32);
             _layers.SetData(layers);
             // Allocate native memory last: a constructor exception above must not leak it.
@@ -164,6 +175,7 @@ namespace LoogaSoft.Terrain.Instances
             CommandBuffer cmd = CommandBufferPool.Get("Looga Detail Placement");
             try
             {
+                cmd.BeginSample(PlacementGpuSample);
                 cmd.SetBufferData(_pageBuffer, _pages);
                 cmd.SetBufferData(_countBuffer, _counts.AsArray());
                 cmd.SetComputeBufferParam(_shader, _kernel, "_Pages", _pageBuffer);
@@ -181,12 +193,23 @@ namespace LoogaSoft.Terrain.Instances
                     cmd.SetComputeIntParam(_shader, "_PageBase", first);
                     cmd.DispatchCompute(_shader, _kernel, Mathf.Min(MaximumGroups, _pages.Count - first), 1, 1);
                 }
+                cmd.EndSample(PlacementGpuSample);
                 Graphics.ExecuteCommandBuffer(cmd);
             }
             finally
             {
                 CommandBufferPool.Release(cmd);
             }
+        }
+
+        /// <summary>Forget the pages queued after the first <paramref name="pageCount"/> pages.</summary>
+        internal void Truncate(int pageCount)
+        {
+            if (pageCount >= _pages.Count) return;
+            Page first = _pages[pageCount];
+            _counts.ResizeUninitialized((int)first.FirstCount);
+            PendingPlacements = (int)first.FirstOutput;
+            _pages.RemoveRange(pageCount, _pages.Count - pageCount);
         }
 
         /// <summary>Forget queued pages. The placement buffer keeps its contents until the next Dispatch.</summary>

@@ -1,0 +1,13 @@
+{
+  "name": "LoogaSoft.Terrain.Barriers.Editor",
+  "rootNamespace": "LoogaSoft.Terrain.Barriers.Editor",
+  "references": [
+    "LoogaSoft.Terrain.Barriers",
+    "Unity.Mathematics",
+    "Unity.Splines"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "autoReferenced": true
+}

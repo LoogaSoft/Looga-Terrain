@@ -80,7 +80,7 @@ namespace LoogaSoft.Terrain.Instances.Tests
                 }
             }
             data.SetHoles(0, 0, holes);
-            // Kubera terrains use instance count mode. New TerrainData can default to coverage mode.
+            // The test uses instance count mode. New TerrainData can default to coverage mode.
             data.SetDetailScatterMode(DetailScatterMode.InstanceCountMode);
             data.SetDetailResolution(32, 16);
             var texture = new Texture2D(2, 2);

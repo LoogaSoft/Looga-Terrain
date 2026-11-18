@@ -1,0 +1,16 @@
+{
+  "name": "LoogaSoft.Terrain.Roads.Editor",
+  "rootNamespace": "LoogaSoft.Terrain.Roads.Editor",
+  "references": [
+    "LoogaSoft.Terrain.Roads",
+    "LoogaSoft.Terrain.Runtime",
+    "LoogaSoft.Terrain.Stamps",
+    "Unity.Collections",
+    "Unity.Mathematics",
+    "Unity.Splines"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "autoReferenced": true
+}

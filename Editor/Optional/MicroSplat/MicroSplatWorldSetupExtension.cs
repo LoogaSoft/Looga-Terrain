@@ -88,15 +88,12 @@ namespace LoogaSoft.Terrain.Integrations.Editor
             if (!terrain.GetComponent<MicroSplatTerrain>()) return;
             MicroSplatTerrainBridge bridge = context.GetOrAddOwned<MicroSplatTerrainBridge>(terrain.gameObject);
             bridge.SynchronizeMaterial();
-            if (!string.IsNullOrEmpty(bridge.Diagnostic))
-            {
-                context.AddWarning(terrain.name + ": " + bridge.Diagnostic);
-            }
+            ReportBridge(terrain, bridge, context);
             if (context.Controller.UseTerrainVirtualTexturing)
             {
                 if (!_producers.TryGetValue(terrain, out Material producer) || !producer)
                 {
-                    context.AddWarning(terrain.name + ": The generated MicroSplat page producer is unavailable.");
+                    context.AddWarning(terrain, "The generated MicroSplat page producer is unavailable.");
                     return;
                 }
                 TerrainVirtualTexture cache = context.GetOrAddOwned<TerrainVirtualTexture>(terrain.gameObject);
@@ -108,7 +105,7 @@ namespace LoogaSoft.Terrain.Integrations.Editor
                 }
                 else
                 {
-                    context.AddInfo(terrain.name + ": Preserved the existing terrain virtual-texture settings.");
+                    context.AddInfo(terrain, "Preserved the existing terrain virtual-texture settings.");
                 }
             }
         }
@@ -121,12 +118,27 @@ namespace LoogaSoft.Terrain.Integrations.Editor
                 MicroSplatTerrainBridge bridge = terrain.GetComponent<MicroSplatTerrainBridge>();
                 if (!bridge)
                 {
-                    context.AddWarning(terrain.name + ": The MicroSplat bridge is absent.");
+                    context.AddWarning(terrain, "The MicroSplat bridge is absent.");
                 }
-                else if (!string.IsNullOrEmpty(bridge.Diagnostic))
+                else
                 {
-                    context.AddWarning(terrain.name + ": " + bridge.Diagnostic);
+                    ReportBridge(terrain, bridge, context);
                 }
+            }
+        }
+
+        // Native rendering for unverified features is the intended fallback, so it is information, not a warning.
+        private static void ReportBridge(UnityEngine.Terrain terrain, MicroSplatTerrainBridge bridge,
+            LoogaWorldSetupContext context)
+        {
+            if (!string.IsNullOrEmpty(bridge.UnverifiedFeatures))
+            {
+                context.AddInfo(terrain, "Uses native rendering. Unverified MicroSplat features: " +
+                    bridge.UnverifiedFeatures + ".");
+            }
+            else if (!string.IsNullOrEmpty(bridge.Diagnostic))
+            {
+                context.AddWarning(terrain, bridge.Diagnostic);
             }
         }
 

@@ -40,7 +40,7 @@ namespace LoogaSoft.Terrain.Editor
                 : null;
             ComputeShader selection = AssetDatabase.LoadAssetAtPath<ComputeShader>(
                 PackagePath + "/Runtime/Shaders/TerrainSelection.compute");
-            Shader shadowBatch = AssetDatabase.LoadAssetAtPath<Shader>(
+            Shader shadowShader = AssetDatabase.LoadAssetAtPath<Shader>(
                 PackagePath + "/Runtime/Shaders/TerrainBatchedShadows.shader");
             if (!selection) context.AddError("TerrainSelection.compute is unavailable.");
             if (!baseSurface) context.AddError("The default terrain surface is unavailable.");
@@ -60,7 +60,7 @@ namespace LoogaSoft.Terrain.Editor
                         if (!extension.HandlesSurface(terrain)) continue;
                         if (!extension.TryCreateSurface(terrain, context, out surface, out string diagnostic) || !surface)
                         {
-                            context.AddWarning(terrain.name + ": " + (diagnostic ?? "The optional surface stayed native."));
+                            context.AddWarning(terrain, diagnostic ?? "The optional surface stayed native.");
                             blocked = true;
                         }
                         break;
@@ -75,14 +75,13 @@ namespace LoogaSoft.Terrain.Editor
                     if (!existed || context.IsOwned(renderer))
                     {
                         Undo.RecordObject(renderer, "Configure Looga Terrain");
-                        renderer.Configure(selection, surface, controller.PatchCount);
-                        renderer.SetLodQuality(controller.ErrorPixels);
-                        renderer.SetShadowCasting(controller.CastTerrainShadows);
+                        renderer.Configure(selection, surface, shadowShader: shadowShader);
+                        renderer.SetSettings(controller.GetTerrainSettings(terrain.transform));
                         EditorUtility.SetDirty(renderer);
                     }
                     else
                     {
-                        context.AddInfo(terrain.name + ": Preserved the existing TerrainRenderer settings.");
+                        context.AddInfo(terrain, "Preserved the existing TerrainRenderer settings.");
                     }
                     renderers.Add(renderer);
                     foreach (LoogaWorldSetupExtension extension in extensions)
@@ -100,7 +99,7 @@ namespace LoogaSoft.Terrain.Editor
                         }
                         else
                         {
-                            context.AddInfo(terrain.name + ": Preserved the existing terrain virtual-texture settings.");
+                            context.AddInfo(terrain, "Preserved the existing terrain virtual-texture settings.");
                         }
                     }
                 }
@@ -155,7 +154,7 @@ namespace LoogaSoft.Terrain.Editor
                     if (context.IsOwned(visibility))
                     {
                         Undo.RecordObject(visibility, "Configure Looga Visibility");
-                        visibility.Configure(null, shadowBatch, controller.CullTerrainShadows, controller.UseHiZ);
+                        visibility.Configure(null, controller.UseHiZ);
                         EditorUtility.SetDirty(visibility);
                     }
                 }
@@ -223,9 +222,10 @@ namespace LoogaSoft.Terrain.Editor
                 TerrainRenderer renderer = terrain.GetComponent<TerrainRenderer>();
                 TerrainVegetationProvider provider = terrain.GetComponent<TerrainVegetationProvider>();
                 if (renderer && string.IsNullOrEmpty(renderer.Diagnostic)) ready++;
-                if (renderer && !string.IsNullOrEmpty(renderer.Diagnostic))
+                // The extension that owns an integration block reports its reason.
+                if (renderer && !string.IsNullOrEmpty(renderer.Diagnostic) && !renderer.HasIntegrationBlock)
                 {
-                    context.AddWarning(terrain.name + ": " + renderer.Diagnostic);
+                    context.AddWarning(terrain, renderer.Diagnostic);
                 }
                 if (provider) providers++;
             }

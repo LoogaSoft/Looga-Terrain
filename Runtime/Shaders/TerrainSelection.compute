@@ -8,10 +8,10 @@
 #pragma kernel CullDepthBatch BATCH_SELECTION
 #pragma kernel ResetVisibleArguments
 #pragma kernel ReduceDepth
-#pragma kernel CullShadowBatch BATCH_SELECTION
-#pragma kernel ResetShadowArguments
-#pragma kernel MergeShadowDraws
 #pragma kernel MergeSurfaceDraws
+#pragma kernel DetectHoles
+#pragma kernel ResetShadowSplitArguments
+#pragma kernel SelectShadowSplit BATCH_SELECTION
 
 struct TileParameters
 {
@@ -165,6 +165,30 @@ void PatchBounds(TileParameters tile, uint nodeOffset, uint2 origin, uint size, 
     maximum = float3(high.x, tile.origin.y + data.y * tile.size.y + 0.01, high.y);
 }
 
+// Height band around the shore detail water level, in metres: the swash runs up above it, troughs go below it.
+static const float ShoreDetailAbove = 1.0;
+static const float ShoreDetailBelow = 0.5;
+
+// The camera rule: split while the projected error of the node is larger than the tile's error pixels.
+bool CameraSplits(TileParameters tile, uint nodeOffset, uint2 origin, uint size)
+{
+    float3 minimum, maximum;
+    PatchBounds(tile, nodeOffset, origin, size, minimum, maximum);
+    float distanceToPatch = _CameraSettings.y != 0 ? 1.0
+        : max(0.01, distance(clamp(_CameraPosition.xyz, minimum, maximum), _CameraPosition.xyz));
+    float metric = tile.quality.z != 0 ? asfloat(LoadNode(nodeOffset + NodeIndex(origin, size)).z) * tile.size.y
+        : max(maximum.x - minimum.x, maximum.z - minimum.z);
+    float threshold = tile.quality.z != 0 ? tile.quality.y : tile.quality.x;
+    // Shore detail (z = water level, w = error scale): a patch whose heights reach the water level is finer, so the
+    // water edge does not jump on a flat beach when the patch changes its detail.
+    if (_CameraSettings.w > 0 && minimum.y <= _CameraSettings.z + ShoreDetailAbove &&
+        maximum.y >= _CameraSettings.z - ShoreDetailBelow)
+    {
+        threshold *= _CameraSettings.w;
+    }
+    return metric * _CameraSettings.x > threshold * distanceToPatch;
+}
+
 bool ShouldSplit(TileParameters tile, uint nodeOffset, uint2 origin, uint size)
 {
     if (size <= 1) return false;
@@ -173,14 +197,7 @@ bool ShouldSplit(TileParameters tile, uint nodeOffset, uint2 origin, uint size)
         || ((_FixedEdges & 4) != 0 && origin.y == 0)
         || ((_FixedEdges & 8) != 0 && origin.y + size == _PatchCount);
     if (fixedBoundary) return true;
-    float3 minimum, maximum;
-    PatchBounds(tile, nodeOffset, origin, size, minimum, maximum);
-    float distanceToPatch = _CameraSettings.y != 0 ? 1.0
-        : max(0.01, distance(clamp(_CameraPosition.xyz, minimum, maximum), _CameraPosition.xyz));
-    float metric = tile.quality.z != 0 ? asfloat(LoadNode(nodeOffset + NodeIndex(origin, size)).z) * tile.size.y
-        : max(maximum.x - minimum.x, maximum.z - minimum.z);
-    float threshold = tile.quality.z != 0 ? tile.quality.y : tile.quality.x;
-    return metric * _CameraSettings.x > threshold * distanceToPatch;
+    return CameraSplits(tile, nodeOffset, origin, size);
 }
 
 void StitchedBounds(TileParameters tile, uint nodeOffset, uint2 origin, uint size,
@@ -383,79 +400,9 @@ void CullDepthBatch(uint3 id : SV_DispatchThreadID)
     _BatchVisible[offset + index] = patch;
 }
 
-StructuredBuffer<float4> _ShadowCandidates;
-float4 _ShadowPlanes[6];
-float4 _ShadowLights[16];
-uint _ShadowLightCount;
-ByteAddressBuffer _ShadowCounts;
-
-bool CanCastIntoView(float3 minimum, float3 maximum)
-{
-    float3 center = (minimum + maximum) * 0.5;
-    float3 extent = (maximum - minimum) * 0.5;
-    for (uint light = 0; light < _ShadowLightCount; light++)
-    {
-        float4 source = _ShadowLights[light];
-        if (source.w > 0)
-        {
-            // Point and spot lights retain every caster inside their range.
-            float3 delta = max(0, abs(source.xyz - center) - extent);
-            if (dot(delta, delta) <= source.w * source.w) return true;
-            continue;
-        }
-        bool reaches = true;
-        for (uint plane = 0; plane < 6; plane++)
-        {
-            float4 equation = _ShadowPlanes[plane];
-            // A directional shadow can extend without a fixed distance along the light rays.
-            if (dot(equation.xyz, source.xyz) > 0) continue;
-            if (dot(equation.xyz, center) + equation.w + dot(abs(equation.xyz), extent) < 0)
-            {
-                reaches = false;
-                break;
-            }
-        }
-        if (reaches) return true;
-    }
-    return false;
-}
-
-[numthreads(64, 1, 1)]
-void ResetShadowArguments(uint3 id : SV_DispatchThreadID)
-{
-    if (id.x < _BatchTileCount) _BatchShadowArguments.Store(id.x * 20 + 4, 0);
-}
-
-[numthreads(64, 1, 1)]
-void CullShadowBatch(uint3 id : SV_DispatchThreadID)
-{
-    if (id.x >= _ShadowCounts.Load(id.y * 20 + 4)) return;
-    uint offset = id.y * _PatchCount * _PatchCount;
-    float4 patch = _ShadowCandidates[offset + id.x];
-    float3 minimum, maximum;
-    StitchedBounds(_BatchTiles[id.y], id.y * _NodeCount, (uint2)patch.xy, (uint)patch.z, minimum, maximum);
-    if (!CanCastIntoView(minimum, maximum)) return;
-    uint index;
-    _BatchShadowArguments.InterlockedAdd(id.y * 20 + 4, 1, index);
-    _BatchShadows[offset + index] = patch;
-}
-
 StructuredBuffer<int> _DrawSlices;
 StructuredBuffer<uint> _MergeTiles;
-RWStructuredBuffer<float4> _MergedShadows;
 RWByteAddressBuffer _MergedArguments;
-[numthreads(64, 1, 1)]
-void MergeShadowDraws(uint3 id : SV_DispatchThreadID)
-{
-    uint tile = _MergeTiles[id.y];
-    if (_DrawSlices[tile] < 0 || id.x >= _BatchShadowArguments.Load(tile * 20 + 4)) return;
-    float4 patch = _BatchShadows[tile * _PatchCount * _PatchCount + id.x];
-    patch.w = tile;
-    uint index;
-    _MergedArguments.InterlockedAdd(4, 1, index);
-    _MergedShadows[index] = patch;
-}
-
 RWStructuredBuffer<float4> _MergedVisible;
 [numthreads(64, 1, 1)]
 void MergeSurfaceDraws(uint3 id : SV_DispatchThreadID)
@@ -467,4 +414,82 @@ void MergeSurfaceDraws(uint3 id : SV_DispatchThreadID)
     uint index;
     _MergedArguments.InterlockedAdd(4, 1, index);
     _MergedVisible[index] = patch;
+}
+
+// Sets the first value to 1 when the terrain has a hole: a holes texel below 0.5, as in LoogaClipHoles. The renderer
+// reads it back and draws the clip variant only for terrains with holes, because a clip stops early depth writes.
+Texture2D<float4> _HoleSource;
+RWStructuredBuffer<uint> _HoleResult;
+uint2 _HoleSize;
+[numthreads(8, 8, 1)]
+void DetectHoles(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= _HoleSize)) return;
+    if (_HoleSource.Load(int3(id.xy, 0)).r < 0.5)
+    {
+        _HoleResult[0] = 1;
+    }
+}
+
+// Light-space shadow patches for the shadow BatchRendererGroup, one culling split per dispatch. A node splits while its
+// height error is larger than the tile's error texels times the split's texel size. With _SplitFollowCamera, it also
+// stops where the camera rule stops, so a caster is never finer than the visible patch. A finer caster lies above a
+// coarse visible patch on convex ground, and the ground then shadows itself in round spots. A persistent split, such
+// as a cache strip of Looga Shadows, does not follow the camera, so it selects the same patches as its level.
+RWStructuredBuffer<uint> _SplitLod;
+// Raw, because the BatchRendererGroup reads it as its visible instance buffer.
+RWByteAddressBuffer _SplitPatches;
+RWByteAddressBuffer _SplitArguments;
+StructuredBuffer<float> _SplitErrors;
+float4 _SplitPlanes[10];
+uint _SplitPlaneCount;
+uint _SplitArgumentCount;
+uint _SplitSlot;
+float _SplitTexel;
+uint _SplitFollowCamera;
+
+[numthreads(64, 1, 1)]
+void ResetShadowSplitArguments(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _SplitArgumentCount) return;
+    _SplitArguments.Store4(id.x * 20, uint4(_BatchIndexCount, 0, 0, 0));
+    _SplitArguments.Store(id.x * 20 + 16, 0);
+}
+
+bool InsideSplit(float3 center, float3 extent)
+{
+    for (uint plane = 0; plane < _SplitPlaneCount; plane++)
+    {
+        float4 equation = _SplitPlanes[plane];
+        if (dot(equation.xyz, center) + equation.w + dot(abs(equation.xyz), extent) < 0) return false;
+    }
+    return true;
+}
+
+[numthreads(8, 8, 1)]
+void SelectShadowSplit(uint3 id : SV_DispatchThreadID)
+{
+    TileParameters tile = _BatchTiles[id.z];
+    uint nodeOffset = id.z * _NodeCount;
+    uint capacity = _PatchCount * _PatchCount;
+    float threshold = _SplitErrors[id.z] * _SplitTexel;
+    uint size = _PatchCount;
+    uint2 origin = 0;
+    while (size > 1 && asfloat(LoadNode(nodeOffset + NodeIndex(origin, size)).z) * tile.size.y > threshold
+        && (_SplitFollowCamera == 0 || CameraSplits(tile, nodeOffset, origin, size)))
+    {
+        size >>= 1;
+        origin = id.xy / size * size;
+    }
+    // One LOD map per split, used to stitch the edges of neighbor patches.
+    uint slot = _SplitSlot * _BatchTileCount + id.z;
+    _SplitLod[slot * capacity + id.y * _PatchCount + id.x] = size;
+    if (any(id.xy != origin)) return;
+    float3 minimum, maximum;
+    StitchedBounds(tile, nodeOffset, origin, size, minimum, maximum);
+    if (!InsideSplit((minimum + maximum) * 0.5, (maximum - minimum) * 0.5)) return;
+    uint index;
+    _SplitArguments.InterlockedAdd(slot * 20 + 4, 1, index);
+    // Packed patch: x 7 bits, y 7 bits, size 8 bits, split from bit 22.
+    _SplitPatches.Store((slot * capacity + index) * 4, origin.x | (origin.y << 7) | (size << 14) | (_SplitSlot << 22));
 }

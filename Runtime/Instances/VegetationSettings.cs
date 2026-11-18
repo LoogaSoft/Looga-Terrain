@@ -5,11 +5,15 @@ using UnityEngine;
 
 namespace LoogaSoft.Terrain.Instances
 {
-    /// <summary>Identifies native terrain vegetation without using a prototype index.</summary>
+    /// <summary>Identifies a vegetation category without using a prototype index.</summary>
     public enum VegetationKind
     {
+        /// <summary>Terrain detail prototypes.</summary>
         Detail,
-        Tree
+        /// <summary>Terrain tree prototypes.</summary>
+        Tree,
+        /// <summary>Prefabs of individually placed instances that are not terrain data, in InstanceSets and InstanceContainers.</summary>
+        Object
     }
 
     /// <summary>Selects fields that a source changes from its kind default.</summary>
@@ -32,9 +36,10 @@ namespace LoogaSoft.Terrain.Instances
         FarDensity = 1 << 12
     }
 
-    /// <summary>Stores shared tree and detail policies and stable source overrides.</summary>
+    /// <summary>Stores shared detail, tree and object policies and stable source overrides.</summary>
+    /// <remarks>InstanceSets and InstanceContainers use the Object policies through IInstanceQualitySource.</remarks>
     [CreateAssetMenu(menuName = "Looga/Terrain/Vegetation Settings")]
-    public sealed class VegetationSettings : ScriptableObject
+    public sealed class VegetationSettings : ScriptableObject, IInstanceQualitySource
     {
         [Serializable]
         public sealed class OverrideEntry
@@ -79,6 +84,7 @@ namespace LoogaSoft.Terrain.Instances
 
         [SerializeField] private InstanceQualitySettings _detailDefaults = InstanceQualitySettings.Default;
         [SerializeField] private InstanceQualitySettings _treeDefaults = InstanceQualitySettings.Default;
+        [SerializeField] private InstanceQualitySettings _objectDefaults = InstanceQualitySettings.Default;
         [SerializeField] private List<OverrideEntry> _overrides = new();
         [Tooltip("Generate mesh detail placements on the GPU. Placement differs from native terrain details. " +
                  "Trees and explicit page sources keep the CPU path.")]
@@ -92,16 +98,29 @@ namespace LoogaSoft.Terrain.Instances
 
         public InstanceQualitySettings DetailDefaults => _detailDefaults;
         public InstanceQualitySettings TreeDefaults => _treeDefaults;
+        public InstanceQualitySettings ObjectDefaults => _objectDefaults;
         public IReadOnlyList<OverrideEntry> Overrides => _overrides ??= new List<OverrideEntry>();
+
+        /// <summary>Returns the default policy of one category.</summary>
+        public InstanceQualitySettings GetDefaults(VegetationKind kind)
+        {
+            switch (kind)
+            {
+                case VegetationKind.Detail:
+                    return _detailDefaults;
+                case VegetationKind.Tree:
+                    return _treeDefaults;
+                case VegetationKind.Object:
+                    return _objectDefaults;
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(kind));
+            }
+        }
 
         /// <summary>Resolve defaults and enabled fields for a stable prefab or texture reference.</summary>
         public InstanceQualitySettings Resolve(VegetationKind kind, UnityEngine.Object source)
         {
-            if (kind != VegetationKind.Detail && kind != VegetationKind.Tree)
-            {
-                throw new ArgumentOutOfRangeException(nameof(kind));
-            }
-            InstanceQualitySettings result = kind == VegetationKind.Tree ? _treeDefaults : _detailDefaults;
+            InstanceQualitySettings result = GetDefaults(kind);
             if (source && _overrides != null)
             {
                 foreach (OverrideEntry entry in _overrides)
@@ -116,37 +135,52 @@ namespace LoogaSoft.Terrain.Instances
             return result;
         }
 
+        /// <summary>Resolve the Object policy of one InstanceSet or InstanceContainer prototype.</summary>
+        public InstanceQualitySettings ResolveInstanceQuality(GameObject prototype)
+        {
+            return Resolve(VegetationKind.Object, prototype);
+        }
+
         /// <summary>Set one kind default and notify active providers.</summary>
         public void SetDefaults(VegetationKind kind, InstanceQualitySettings quality)
         {
             Validate(quality);
-            InstanceQualitySettings previous;
-            if (kind == VegetationKind.Tree)
-            {
-                previous = _treeDefaults;
-                _treeDefaults = quality;
-            }
-            else if (kind == VegetationKind.Detail)
-            {
-                previous = _detailDefaults;
-                _detailDefaults = quality;
-            }
-            else throw new ArgumentOutOfRangeException(nameof(kind));
+            InstanceQualitySettings previous = GetDefaults(kind);
+            StoreDefaults(kind, quality);
             try
             {
                 if (_overrides != null)
                 {
                     foreach (OverrideEntry entry in _overrides)
+                    {
                         if (entry != null && entry.Kind == kind && entry.Source) Resolve(kind, entry.Source);
+                    }
                 }
             }
             catch
             {
-                if (kind == VegetationKind.Tree) _treeDefaults = previous;
-                else _detailDefaults = previous;
+                StoreDefaults(kind, previous);
                 throw;
             }
             NotifyChanged();
+        }
+
+        private void StoreDefaults(VegetationKind kind, InstanceQualitySettings quality)
+        {
+            switch (kind)
+            {
+                case VegetationKind.Detail:
+                    _detailDefaults = quality;
+                    break;
+                case VegetationKind.Tree:
+                    _treeDefaults = quality;
+                    break;
+                case VegetationKind.Object:
+                    _objectDefaults = quality;
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(kind));
+            }
         }
 
         /// <summary>Replace one source override and notify active providers.</summary>
@@ -162,8 +196,7 @@ namespace LoogaSoft.Terrain.Instances
                 VegetationQualityFields.LodBias | VegetationQualityFields.ShadowMode |
                 VegetationQualityFields.DensityFalloffDistance | VegetationQualityFields.FarDensity;
             if ((fields & ~allFields) != 0) throw new ArgumentOutOfRangeException(nameof(fields));
-            InstanceQualitySettings resolved = kind == VegetationKind.Tree ? _treeDefaults : _detailDefaults;
-            resolved = new OverrideEntry(kind, source, fields, quality).Apply(resolved);
+            InstanceQualitySettings resolved = new OverrideEntry(kind, source, fields, quality).Apply(GetDefaults(kind));
             Validate(resolved);
             _overrides ??= new List<OverrideEntry>();
             _overrides.RemoveAll(entry => entry != null && entry.Kind == kind && entry.Source == source);
@@ -213,12 +246,13 @@ namespace LoogaSoft.Terrain.Instances
 
         private static void ValidateSource(VegetationKind kind, UnityEngine.Object source)
         {
-            if (kind != VegetationKind.Detail && kind != VegetationKind.Tree)
+            if (kind != VegetationKind.Detail && kind != VegetationKind.Tree && kind != VegetationKind.Object)
                 throw new ArgumentOutOfRangeException(nameof(kind));
-            if (!source || (kind == VegetationKind.Tree && !(source is GameObject)) ||
+            if (!source || (kind != VegetationKind.Detail && !(source is GameObject)) ||
                 (kind == VegetationKind.Detail && !(source is GameObject) && !(source is Texture2D)))
             {
-                throw new ArgumentException("Use a tree prefab, detail prefab, or detail texture.", nameof(source));
+                throw new ArgumentException("Use a tree prefab, object prefab, detail prefab, or detail texture.",
+                    nameof(source));
             }
         }
 

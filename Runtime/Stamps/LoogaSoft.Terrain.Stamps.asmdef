@@ -1,0 +1,15 @@
+{
+  "name": "LoogaSoft.Terrain.Stamps",
+  "rootNamespace": "LoogaSoft.Terrain.Stamps",
+  "references": [
+    "LoogaSoft.Terrain.Runtime",
+    "LoogaSoft.Terrain.Instances",
+    "LoogaSoft.Instancing.Runtime",
+    "Unity.Burst",
+    "Unity.Collections",
+    "Unity.Mathematics",
+    "Unity.Splines"
+  ],
+  "allowUnsafeCode": true,
+  "autoReferenced": true
+}

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using LoogaSoft.Instancing;
 using LoogaSoft.Terrain.Instances;
 using UnityEngine;
 
@@ -10,8 +11,12 @@ namespace LoogaSoft.Terrain.Editor
     {
         public sealed class Usage
         {
+            /// <summary>Terrain that uses a Detail or Tree source. Null for an Object source.</summary>
             public TerrainVegetationProvider Provider;
+            /// <summary>Terrain prototype slot of a Detail or Tree source.</summary>
             public int PrototypeIndex;
+            /// <summary>InstanceSet or InstanceContainer that places an Object source. Null for terrain sources.</summary>
+            public Component Owner;
         }
 
         public sealed class Entry
@@ -21,11 +26,12 @@ namespace LoogaSoft.Terrain.Editor
             public readonly List<Usage> Usages = new();
             public long? SourceCount;
             public int? VisibleCount;
-            public string CountLabel => Kind == VegetationKind.Tree ? "Source placements" : "Paint units";
+            public string CountLabel => GetCountLabel(Kind);
 
             /// <summary>Returns unique loaded placements, including slots rejected by camera culling.</summary>
             public int GetResidentCount()
             {
+                if (Kind == VegetationKind.Object) return CountObjectPlacements(this, true);
                 int count = 0;
                 var seen = new HashSet<TerrainVegetationProvider>();
                 foreach (Usage usage in Usages)
@@ -55,8 +61,32 @@ namespace LoogaSoft.Terrain.Editor
             }
         }
 
-        /// <summary>Groups prototype slots by category and source asset, independent of slot ordering.</summary>
+        /// <summary>Returns the name of the source count of one category.</summary>
+        public static string GetCountLabel(VegetationKind kind)
+        {
+            switch (kind)
+            {
+                case VegetationKind.Detail:
+                    return "Paint units";
+                case VegetationKind.Tree:
+                    return "Source placements";
+                default:
+                    return "Placements";
+            }
+        }
+
+        /// <summary>Groups terrain prototype slots by category and source asset, independent of slot ordering.</summary>
         public static List<Entry> Build(IEnumerable<TerrainVegetationProvider> providers)
+        {
+            return Build(providers, Array.Empty<InstanceSet>(), Array.Empty<InstanceContainer>());
+        }
+
+        /// <summary>
+        /// Groups terrain prototype slots and instance prototypes by category and source asset. Object entries get
+        /// their placement counts at once, because the sets and containers store them.
+        /// </summary>
+        public static List<Entry> Build(IEnumerable<TerrainVegetationProvider> providers, IEnumerable<InstanceSet> sets,
+            IEnumerable<InstanceContainer> containers)
         {
             var entries = new List<Entry>();
             var keys = new Dictionary<(VegetationKind, UnityEngine.Object), Entry>();
@@ -80,6 +110,28 @@ namespace LoogaSoft.Terrain.Editor
                     Add(VegetationKind.Tree, trees[i].prefab, provider, i, keys, entries);
                 }
             }
+            var prototypes = new List<GameObject>();
+            foreach (InstanceSet set in sets)
+            {
+                if (!set) continue;
+                prototypes.Clear();
+                set.GetPrototypes(prototypes);
+                foreach (GameObject prototype in prototypes)
+                {
+                    AddObject(prototype, set, keys, entries);
+                }
+            }
+            foreach (InstanceContainer container in containers)
+            {
+                if (container) AddObject(container.Prototype, container, keys, entries);
+            }
+            foreach (Entry entry in entries)
+            {
+                if (entry.Kind == VegetationKind.Object)
+                {
+                    entry.SourceCount = CountObjectPlacements(entry, false);
+                }
+            }
             entries.Sort((a, b) =>
             {
                 int category = a.Kind.CompareTo(b.Kind);
@@ -95,6 +147,11 @@ namespace LoogaSoft.Terrain.Editor
             for (int e = 0; e < entries.Count; e++)
             {
                 Entry entry = entries[e];
+                if (entry.Kind == VegetationKind.Object)
+                {
+                    counts[e] = CountObjectPlacements(entry, false);
+                    continue;
+                }
                 for (int u = 0; u < entry.Usages.Count; u++)
                 {
                     Usage usage = entry.Usages[u];
@@ -147,8 +204,40 @@ namespace LoogaSoft.Terrain.Editor
             return true;
         }
 
+        // Resident placements are the placements of an active owner with a renderer.
+        private static int CountObjectPlacements(Entry entry, bool residentOnly)
+        {
+            var prototype = entry.Source as GameObject;
+            int count = 0;
+            foreach (Usage usage in entry.Usages)
+            {
+                if (usage.Owner is InstanceSet set && set)
+                {
+                    if (!residentOnly || (set.isActiveAndEnabled && set.Renderer != null))
+                    {
+                        count += set.CountPlacements(prototype);
+                    }
+                }
+                else if (usage.Owner is InstanceContainer container && container)
+                {
+                    if (!residentOnly || (container.isActiveAndEnabled && container.Renderer != null))
+                    {
+                        count += container.PlacementCount;
+                    }
+                }
+            }
+            return count;
+        }
+
+        private static void AddObject(GameObject prototype, Component owner,
+            Dictionary<(VegetationKind, UnityEngine.Object), Entry> keys, List<Entry> entries)
+        {
+            Add(VegetationKind.Object, prototype, null, -1, keys, entries, owner);
+        }
+
         private static void Add(VegetationKind kind, UnityEngine.Object source, TerrainVegetationProvider provider,
-            int index, Dictionary<(VegetationKind, UnityEngine.Object), Entry> keys, List<Entry> entries)
+            int index, Dictionary<(VegetationKind, UnityEngine.Object), Entry> keys, List<Entry> entries,
+            Component owner = null)
         {
             if (!source) return;
             var key = (kind, source);
@@ -158,7 +247,7 @@ namespace LoogaSoft.Terrain.Editor
                 keys.Add(key, entry);
                 entries.Add(entry);
             }
-            entry.Usages.Add(new Usage { Provider = provider, PrototypeIndex = index });
+            entry.Usages.Add(new Usage { Provider = provider, PrototypeIndex = index, Owner = owner });
         }
     }
 }

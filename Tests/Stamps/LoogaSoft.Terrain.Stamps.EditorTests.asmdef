@@ -1,0 +1,21 @@
+{
+  "name": "LoogaSoft.Terrain.Stamps.EditorTests",
+  "rootNamespace": "LoogaSoft.Terrain.Stamps.Tests",
+  "references": [
+    "LoogaSoft.Terrain.Stamps",
+    "LoogaSoft.Instancing.Runtime",
+    "Unity.Mathematics",
+    "Unity.Splines",
+    "LoogaSoft.Terrain.Stamps.Editor"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "optionalUnityReferences": [
+    "TestAssemblies"
+  ],
+  "autoReferenced": false,
+  "defineConstraints": [
+    "UNITY_INCLUDE_TESTS"
+  ]
+}

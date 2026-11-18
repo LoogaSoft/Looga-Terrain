@@ -24,7 +24,7 @@ namespace LoogaSoft.Terrain.Tests
             Shader shader = Shader.Find(shaderName);
             if (!shader) Assert.Ignore("The optional material package is absent.");
             Assert.Zero(Shader.GetGlobalInt("_LoogaGroundCount"));
-            Assert.Zero(Shader.GetGlobalInt("_LoogaRvtEnabled"));
+            Assert.Zero(Shader.GetGlobalInteger("_LoogaRvtEnabled"));
             bool graphics = shaderName != "Looga/Terrain/Vegetation Lit";
             Scene scene = EditorSceneManager.NewPreviewScene();
             var material = new Material(shader);
@@ -103,7 +103,7 @@ namespace LoogaSoft.Terrain.Tests
                 Shader.SetGlobalVectorArray("_LoogaRvtAtlasRects", new[] { new Vector4(0, 0, 0.5f, 0.5f), new Vector4(0.5f, 0, 0.5f, 0.5f), Vector4.zero, Vector4.zero });
                 Shader.SetGlobalVector("_LoogaRvtHeightRange", new Vector4(0, 8, 0, 0.1f));
                 Shader.SetGlobalInteger("_LoogaRvtClipmapCount", 2);
-                Shader.SetGlobalInt("_LoogaRvtEnabled", graphics ? 1 : 0);
+                Shader.SetGlobalInteger("_LoogaRvtEnabled", graphics ? 1 : 0);
                 var root = GameObject.CreatePrimitive(PrimitiveType.Cube);
                 SceneManager.MoveGameObjectToScene(root, scene);
                 root.layer = 30;
@@ -164,7 +164,7 @@ namespace LoogaSoft.Terrain.Tests
                 Shader.SetGlobalTexture("_LoogaGroundCacheAlbedo", null);
                 Shader.SetGlobalTexture("_LoogaGroundCacheNormal", null);
                 Shader.SetGlobalTexture("_LoogaGroundCacheEmission", null);
-                Shader.SetGlobalInt("_LoogaRvtEnabled", 0);
+                Shader.SetGlobalInteger("_LoogaRvtEnabled", 0);
                 Shader.SetGlobalInteger("_LoogaRvtClipmapCount", 0);
                 Shader.SetGlobalTexture("_LoogaRvtAlbedoAtlas", null);
                 Shader.SetGlobalTexture("_LoogaRvtNormalAtlas", null);

@@ -7,7 +7,7 @@ namespace LoogaSoft.Terrain
 {
     public sealed partial class TerrainRenderer
     {
-        private sealed class SelectionCommands : IDisposable
+        private sealed partial class SelectionCommands : IDisposable
         {
             private readonly List<TerrainRenderer> _members = new();
             private readonly List<SelectionBatch> _batches = new();
@@ -58,35 +58,11 @@ namespace LoogaSoft.Terrain
                 }
             }
 
-            public void CullShadows(CommandBuffer commands, Vector4[] planes, Vector4[] lights, int lightCount)
-            {
-                foreach (SelectionBatch batch in _batches)
-                {
-                    batch.CullShadows(commands, planes, lights, lightCount);
-                }
-            }
-
-            public void SubmitShadowBatches(Shader shader, int minimumTiles)
-            {
-                foreach (SelectionBatch batch in _batches)
-                {
-                    batch.SubmitShadowBatches(shader, minimumTiles);
-                }
-            }
-
             public void SubmitSurfaceBatches()
             {
                 foreach (SelectionBatch batch in _batches)
                 {
                     batch.SubmitSurfaceBatches();
-                }
-            }
-
-            public void ReleaseShadowBatches()
-            {
-                foreach (SelectionBatch batch in _batches)
-                {
-                    batch.ReleaseShadowBatches();
                 }
             }
 
@@ -123,12 +99,17 @@ namespace LoogaSoft.Terrain
             private readonly CameraBuffers[] _views;
             private readonly int _nodeCount;
             private readonly int _copyKernel;
+            private readonly int _resetArgumentsKernel;
+            private readonly int _selectBatchKernel;
+            private readonly int _patchCount;
+            private readonly int _indexCount;
             private ComputeShader _compute;
             private CommandBuffer _commands;
+            // GPU sampler: gives the GPU time of the selection dispatches.
+            private static readonly UnityEngine.Profiling.CustomSampler SelectionGpuSample =
+                UnityEngine.Profiling.CustomSampler.Create("Looga Terrain Selection", true);
             private GraphicsBuffer _nodes;
             private GraphicsBuffer _tiles;
-            private GraphicsBuffer _shadowCandidates;
-            private GraphicsBuffer _shadowCounts;
             private GraphicsBuffer _occlusionStatistics;
 
             public GraphicsBuffer Visible { get; private set; }
@@ -145,6 +126,8 @@ namespace LoogaSoft.Terrain
                 int patchCount = members[0]._activePatchCount;
                 int capacity = patchCount * patchCount;
                 _nodeCount = (capacity * 4 - 1) / 3;
+                _patchCount = patchCount;
+                _indexCount = (int)members[0]._mesh.GetIndexCount(0);
                 _parameters = new TileParameters[count];
                 _metadataVersions = new int[count];
                 _selectionVersions = new int[count];
@@ -156,8 +139,8 @@ namespace LoogaSoft.Terrain
                     _compute = Instantiate(members[0]._selectionCompute);
                     _compute.hideFlags = HideFlags.HideAndDontSave;
                     _copyKernel = _compute.FindKernel("CopyBatchNodes");
-                    int resetKernel = _compute.FindKernel("ResetBatchArguments");
-                    int selectKernel = _compute.FindKernel("SelectBatch");
+                    _resetArgumentsKernel = _compute.FindKernel("ResetBatchArguments");
+                    _selectBatchKernel = _compute.FindKernel("SelectBatch");
                     _nodes = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _nodeCount * count, 16);
                     _tiles = new GraphicsBuffer(GraphicsBuffer.Target.Structured, count, 48);
                     Visible = new GraphicsBuffer(GraphicsBuffer.Target.Structured, capacity * count, 16);
@@ -167,25 +150,13 @@ namespace LoogaSoft.Terrain
                     VisibleArguments = new GraphicsBuffer(target, count, GraphicsBuffer.IndirectDrawIndexedArgs.size);
                     ShadowArguments = new GraphicsBuffer(target | GraphicsBuffer.Target.CopySource, count, GraphicsBuffer.IndirectDrawIndexedArgs.size);
                     _occlusionStatistics = new GraphicsBuffer(GraphicsBuffer.Target.Structured, count, 8);
-                    _compute.SetConstantBuffer(CameraParametersId, _cameraParameters, 0, 128);
-                    _compute.SetInt(PatchCountId, patchCount);
-                    _compute.SetInt(NodeCountId, _nodeCount);
-                    _compute.SetInt(FixedEdgesId, 0);
-                    _compute.SetInt("_BatchTileCount", count);
-                    _compute.SetInt("_BatchIndexCount", (int)members[0]._mesh.GetIndexCount(0));
-                    _compute.SetBuffer(_copyKernel, "_BatchNodeData", _nodes);
-                    _compute.SetBuffer(selectKernel, "_BatchNodeData", _nodes);
-                    _compute.SetBuffer(selectKernel, "_BatchTiles", _tiles);
-                    _compute.SetBuffer(selectKernel, "_BatchVisible", Visible);
-                    _compute.SetBuffer(selectKernel, "_BatchShadows", Shadows);
-                    _compute.SetBuffer(selectKernel, "_BatchLod", LodMap);
-                    _compute.SetBuffer(selectKernel, "_BatchVisibleArguments", VisibleArguments);
-                    _compute.SetBuffer(selectKernel, "_BatchShadowArguments", ShadowArguments);
-                    _compute.SetBuffer(resetKernel, "_BatchVisibleArguments", VisibleArguments);
-                    _compute.SetBuffer(resetKernel, "_BatchShadowArguments", ShadowArguments);
+                    BindState();
                     _commands = new CommandBuffer { name = "Looga Terrain Batched Selection" };
-                    _commands.DispatchCompute(_compute, resetKernel, (count + 63) / 64, 1, 1);
-                    _commands.DispatchCompute(_compute, selectKernel, (patchCount + 7) / 8, (patchCount + 7) / 8, count);
+                    _commands.BeginSample(SelectionGpuSample);
+                    _commands.DispatchCompute(_compute, _resetArgumentsKernel, (count + 63) / 64, 1, 1);
+                    int groups = (patchCount + 7) / 8;
+                    _commands.DispatchCompute(_compute, _selectBatchKernel, groups, groups, count);
+                    _commands.EndSample(SelectionGpuSample);
                     for (int index = 0; index < count; index++)
                     {
                         _views[index] = new CameraBuffers(this, index, capacity);
@@ -199,8 +170,31 @@ namespace LoogaSoft.Terrain
                 }
             }
 
+            // The compute shader instance can lose these bindings (seen in Unity 6.7 after shader imports), and the
+            // cached command buffer records only the dispatches. Execute binds them again each frame.
+            private void BindState()
+            {
+                _compute.SetConstantBuffer(CameraParametersId, _cameraParameters, 0, 128);
+                _compute.SetInt(PatchCountId, _patchCount);
+                _compute.SetInt(NodeCountId, _nodeCount);
+                _compute.SetInt(FixedEdgesId, 0);
+                _compute.SetInt("_BatchTileCount", _members.Count);
+                _compute.SetInt("_BatchIndexCount", _indexCount);
+                _compute.SetBuffer(_copyKernel, "_BatchNodeData", _nodes);
+                _compute.SetBuffer(_selectBatchKernel, "_BatchNodeData", _nodes);
+                _compute.SetBuffer(_selectBatchKernel, "_BatchTiles", _tiles);
+                _compute.SetBuffer(_selectBatchKernel, "_BatchVisible", Visible);
+                _compute.SetBuffer(_selectBatchKernel, "_BatchShadows", Shadows);
+                _compute.SetBuffer(_selectBatchKernel, "_BatchLod", LodMap);
+                _compute.SetBuffer(_selectBatchKernel, "_BatchVisibleArguments", VisibleArguments);
+                _compute.SetBuffer(_selectBatchKernel, "_BatchShadowArguments", ShadowArguments);
+                _compute.SetBuffer(_resetArgumentsKernel, "_BatchVisibleArguments", VisibleArguments);
+                _compute.SetBuffer(_resetArgumentsKernel, "_BatchShadowArguments", ShadowArguments);
+            }
+
             public void Execute()
             {
+                BindState();
                 bool parametersChanged = false;
                 for (int index = 0; index < _members.Count; index++)
                 {
@@ -219,7 +213,7 @@ namespace LoogaSoft.Terrain
                         Origin = renderer._origin,
                         Size = renderer._size,
                         Quality = new Vector4(renderer.EffectiveTargetPatchPixels, renderer.EffectiveErrorPixels,
-                            renderer._useGeometricError ? 1 : 0, renderer._frustumCulling ? 1 : 0)
+                            renderer._useGeometricError ? 1 : 0, renderer.FrustumCulling ? 1 : 0)
                     };
                     _selectionVersions[index] = renderer._selectionVersion;
                     parametersChanged = true;
@@ -228,39 +222,14 @@ namespace LoogaSoft.Terrain
                 {
                     _tiles.SetData(_parameters);
                 }
+                BeginShadowGroupFrame();
                 foreach (CameraBuffers view in _views)
                 {
                     view.OcclusionApplied = false;
                     view.SurfacesBatched = false;
-                    view.ShadowsBatched = false;
                     view.SubmissionCount = 0;
                 }
                 Graphics.ExecuteCommandBuffer(_commands);
-            }
-
-            public void CullShadows(CommandBuffer commands, Vector4[] planes, Vector4[] lights, int lightCount)
-            {
-                _shadowCandidates ??= new GraphicsBuffer(GraphicsBuffer.Target.Structured | GraphicsBuffer.Target.CopyDestination, Shadows.count, 16);
-                _shadowCounts ??= new GraphicsBuffer(GraphicsBuffer.Target.Raw | GraphicsBuffer.Target.CopyDestination, ShadowArguments.count * 5, 4);
-                commands.CopyBuffer(Shadows, _shadowCandidates);
-                commands.CopyBuffer(ShadowArguments, _shadowCounts);
-                int reset = _compute.FindKernel("ResetShadowArguments"), cull = _compute.FindKernel("CullShadowBatch");
-                commands.SetComputeBufferParam(_compute, reset, "_BatchShadowArguments", ShadowArguments);
-                commands.DispatchCompute(_compute, reset, (_members.Count + 63) / 64, 1, 1);
-                commands.SetComputeBufferParam(_compute, cull, "_BatchShadowArguments", ShadowArguments);
-                commands.SetComputeBufferParam(_compute, cull, "_BatchShadows", Shadows);
-                commands.SetComputeBufferParam(_compute, cull, "_ShadowCandidates", _shadowCandidates);
-                commands.SetComputeBufferParam(_compute, cull, "_ShadowCounts", _shadowCounts);
-                commands.SetComputeBufferParam(_compute, cull, "_BatchNodeData", _nodes);
-                commands.SetComputeBufferParam(_compute, cull, "_BatchTiles", _tiles);
-                commands.SetComputeVectorArrayParam(_compute, "_ShadowPlanes", planes);
-                commands.SetComputeVectorArrayParam(_compute, "_ShadowLights", lights);
-                commands.SetComputeIntParam(_compute, "_ShadowLightCount", lightCount);
-                commands.DispatchCompute(_compute, cull, (_members[0]._activePatchCount * _members[0]._activePatchCount + 63) / 64, _members.Count, 1);
-                foreach (CameraBuffers view in _views)
-                {
-                    view.OcclusionApplied = true;
-                }
             }
 
             public void CullDepth(CommandBuffer commands, Texture depth, Matrix4x4 projection, int width, int height,
@@ -325,11 +294,8 @@ namespace LoogaSoft.Terrain
                 _commands?.Dispose();
                 _commands = null;
                 ReleaseSurfaceBatches();
-                ReleaseShadowBatches();
-                _shadowCandidates?.Dispose();
-                _shadowCounts?.Dispose();
+                ReleaseShadowGroup();
                 _occlusionStatistics?.Dispose();
-                _shadowCandidates = _shadowCounts = null;
                 _occlusionStatistics = null;
                 _nodes?.Dispose();
                 _tiles?.Dispose();

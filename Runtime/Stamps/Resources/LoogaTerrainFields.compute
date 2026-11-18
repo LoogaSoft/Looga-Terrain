@@ -1,0 +1,289 @@
+// Looga Stamps terrain fields: shape values of the ground that texture, detail and object stamps can filter by.
+// The field grid of a tile has _FieldSize texels. Texel i lies at tile UV (i + 0.5) / _FieldSize, the UV that the stamp
+// filters read. The ground grid adds _Apron texels on each side and reads the neighbour tiles there.
+// 1. Gather: world heights of the ground grid from the heightmaps of the tile and its eight neighbours.
+// 2. Steepness: the ground grid gets the steepness of each texel in degrees.
+// 3. Fields: two RGBA maps per tile (see TerrainField in TerrainFieldFilter.cs for the channels). The face search
+//    turns its directions by a hash of the world texel, so its rays do not draw star patterns around small faces.
+// 4. BlurFaces: a 5 x 5 blur of the face map smooths the noise of the turned rays.
+// SurfaceFields reads the ground grid and the flow map and writes the field map of the terrain surface. It replaces
+// steps 3 and 4 when only that map is necessary.
+#pragma kernel Gather
+#pragma kernel Steepness
+#pragma kernel Fields
+#pragma kernel BlurFaces
+#pragma kernel SurfaceFields
+
+#define LOOGA_PI 3.14159265358979
+// Directions of the face search.
+#define FACE_DIRECTIONS 32
+#define RING_SAMPLES 8
+
+int _FieldSize;
+int _Apron;
+int _GroundSize;
+// Size of one field texel, in metres.
+float _Cell;
+// World position of field texel 0 in texels, so the ray turn of a texel is the same in every tile.
+int2 _TexelOrigin;
+
+// Heightmaps of the 3 x 3 tiles, row by row from the bottom left (slot 4 = the tile itself).
+Texture2D<float> _Heights0;
+Texture2D<float> _Heights1;
+Texture2D<float> _Heights2;
+Texture2D<float> _Heights3;
+Texture2D<float> _Heights4;
+Texture2D<float> _Heights5;
+Texture2D<float> _Heights6;
+Texture2D<float> _Heights7;
+Texture2D<float> _Heights8;
+// For each slot: x = terrain position y, y = real height (metres of one heightmap unit), z = resolution, w = 1 if the
+// tile exists.
+float4 _Slots[9];
+
+RWTexture2D<float> _GroundHeights;
+Texture2D<float> _GroundHeightsIn;
+RWTexture2D<float2> _Ground;
+Texture2D<float2> _GroundIn;
+SamplerState looga_linear_clamp_sampler;
+
+RWTexture2D<float4> _Shape;
+RWTexture2D<float4> _Faces;
+Texture2D<float4> _FacesIn;
+
+// Ground at least this steep is a face, in degrees.
+float _FaceAngle;
+// A face counts above or below the point only if it rises or falls at least this height, in metres.
+float _MinimumRise;
+// Largest distance of the face search, in metres.
+float _Reach;
+// Radii of the small and the large relative height, in metres.
+float _SmallRadius;
+float _LargeRadius;
+
+// Surface field map (LoogaTerrainSurfaceFields): R wetness 2 to 15, G relative height 4 m from -2 to 2 m, B relative
+// height 20 m from -8 to 8 m, A log10 flow area 0 to 6. Texel i lies at tile UV i / (_SurfaceSize - 1).
+RWTexture2D<unorm float4> _Surface;
+Texture2D<float2> _WaterIn;
+int _SurfaceSize;
+// The written texels: first texel, and the texel past the last one.
+int2 _SurfaceOrigin;
+int2 _SurfaceEnd;
+// Wetness index of filled pits and flats (TerrainFlow.FilledWetness).
+#define FILLED_WETNESS 14.0
+// Wetness index of a filled cell without a hollow.
+#define DRY_FILLED_WETNESS 6.0
+
+// Bilinear sample with texel centres at (k + 0.5) / resolution, clamped like a linear clamp sampler. Load reads the
+// stored values, so forced anisotropic filtering cannot change them.
+float LoadBilinear(Texture2D<float> heights, float2 uv, float resolution)
+{
+    float2 position = clamp(uv * resolution - 0.5, 0, resolution - 1);
+    int2 low = (int2)floor(position);
+    int2 high = min(low + 1, (int)resolution - 1);
+    float2 blend = position - low;
+    float bottom = lerp(heights.Load(int3(low.x, low.y, 0)), heights.Load(int3(high.x, low.y, 0)), blend.x);
+    float top = lerp(heights.Load(int3(low.x, high.y, 0)), heights.Load(int3(high.x, high.y, 0)), blend.x);
+    return lerp(bottom, top, blend.y);
+}
+
+float SlotSample(int slot, float2 uv)
+{
+    float resolution = _Slots[slot].z;
+    switch (slot)
+    {
+        case 0: return LoadBilinear(_Heights0, uv, resolution);
+        case 1: return LoadBilinear(_Heights1, uv, resolution);
+        case 2: return LoadBilinear(_Heights2, uv, resolution);
+        case 3: return LoadBilinear(_Heights3, uv, resolution);
+        case 5: return LoadBilinear(_Heights5, uv, resolution);
+        case 6: return LoadBilinear(_Heights6, uv, resolution);
+        case 7: return LoadBilinear(_Heights7, uv, resolution);
+        case 8: return LoadBilinear(_Heights8, uv, resolution);
+        default: return LoadBilinear(_Heights4, uv, resolution);
+    }
+}
+
+[numthreads(8, 8, 1)]
+void Gather(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _GroundSize || (int)id.y >= _GroundSize) return;
+    float2 uv = ((float2)id.xy - _Apron + 0.5) / _FieldSize;
+    int2 offset = int2(uv.x < 0 ? -1 : (uv.x >= 1 ? 1 : 0), uv.y < 0 ? -1 : (uv.y >= 1 ? 1 : 0));
+    int slot = (offset.y + 1) * 3 + offset.x + 1;
+    float2 local = uv - offset;
+    // Past the edge of the world, the tile repeats its edge heights.
+    if (_Slots[slot].w < 0.5)
+    {
+        slot = 4;
+        local = saturate(uv);
+    }
+    _GroundHeights[id.xy] = _Slots[slot].x + SlotSample(slot, local) * _Slots[slot].y;
+}
+
+[numthreads(8, 8, 1)]
+void Steepness(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _GroundSize || (int)id.y >= _GroundSize) return;
+    int last = _GroundSize - 1;
+    int2 left = int2(max((int)id.x - 1, 0), id.y);
+    int2 right = int2(min((int)id.x + 1, last), id.y);
+    int2 down = int2(id.x, max((int)id.y - 1, 0));
+    int2 up = int2(id.x, min((int)id.y + 1, last));
+    float dx = (_GroundHeightsIn[right] - _GroundHeightsIn[left]) / (max(right.x - left.x, 1) * _Cell);
+    float dz = (_GroundHeightsIn[up] - _GroundHeightsIn[down]) / (max(up.y - down.y, 1) * _Cell);
+    float steepness = atan(length(float2(dx, dz))) * (180.0 / LOOGA_PI);
+    _Ground[id.xy] = float2(_GroundHeightsIn[id.xy], steepness);
+}
+
+// Hash of a world texel, from 0 to 1 (PCG).
+float TexelHash(int2 texel)
+{
+    uint value = (uint)texel.x * 747796405u + (uint)texel.y * 2891336453u;
+    value = ((value >> ((value >> 28u) + 4u)) ^ value) * 277803737u;
+    value = (value >> 22u) ^ value;
+    return value / 4294967296.0;
+}
+
+// Height and steepness at a ground grid position in texels (texel centres at whole numbers).
+float2 GroundAt(float2 position)
+{
+    return _GroundIn.SampleLevel(looga_linear_clamp_sampler, (position + 0.5) / _GroundSize, 0);
+}
+
+// Height of the point above the mean height of two rings at half the radius and at the radius.
+float RelativeHeight(float2 position, float height, float radius)
+{
+    float sum = 0;
+    float rings = radius / _Cell;
+    [unroll]
+    for (int ring = 1; ring <= 2; ring++)
+    {
+        float distance = rings * ring * 0.5;
+        float turn = ring == 1 ? LOOGA_PI / RING_SAMPLES : 0;
+        [unroll]
+        for (int sample = 0; sample < RING_SAMPLES; sample++)
+        {
+            float angle = sample * (2 * LOOGA_PI / RING_SAMPLES) + turn;
+            sum += GroundAt(position + float2(cos(angle), sin(angle)) * distance).x;
+        }
+    }
+    return height - sum / (2 * RING_SAMPLES);
+}
+
+[numthreads(8, 8, 1)]
+void Fields(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _FieldSize || (int)id.y >= _FieldSize) return;
+    float2 position = (float2)id.xy + _Apron;
+    float2 here = GroundAt(position);
+    float height = here.x;
+
+    float east = GroundAt(position + float2(1, 0)).x - GroundAt(position - float2(1, 0)).x;
+    float north = GroundAt(position + float2(0, 1)).x - GroundAt(position - float2(0, 1)).x;
+    float3 normal = normalize(float3(-east, 2 * _Cell, -north));
+
+    float aboveDistance = _Reach;
+    float aboveTangent = 0;
+    float belowDistance = _Reach;
+    float belowDrop = 0;
+    float minimumStep = _Cell;
+    float turn = TexelHash(_TexelOrigin + (int2)id.xy);
+    [loop]
+    for (int direction = 0; direction < FACE_DIRECTIONS; direction++)
+    {
+        // A face above counts only if no ground between hides its top: its elevation must reach the horizon so far.
+        float horizon = -1e6;
+        float distance = minimumStep;
+        float angle = (direction + turn) * (2 * LOOGA_PI / FACE_DIRECTIONS);
+        float2 along = float2(cos(angle), sin(angle)) / _Cell;
+        [loop]
+        while (distance <= _Reach)
+        {
+            float2 ground = GroundAt(position + along * distance);
+            float rise = ground.x - height;
+            float tangent = rise / distance;
+            if (ground.y >= _FaceAngle)
+            {
+                if (rise > _MinimumRise && tangent >= horizon - 0.02)
+                {
+                    aboveDistance = min(aboveDistance, distance);
+                    aboveTangent = max(aboveTangent, tangent);
+                }
+                else if (rise < -_MinimumRise)
+                {
+                    belowDistance = min(belowDistance, distance);
+                    belowDrop = max(belowDrop, -rise);
+                }
+            }
+            horizon = max(horizon, tangent);
+            // One texel steps near the point, then steps that grow by a tenth of the distance.
+            distance += max(minimumStep, distance * 0.1);
+        }
+    }
+
+    _Shape[id.xy] = float4(here.y, RelativeHeight(position, height, _SmallRadius),
+        RelativeHeight(position, height, _LargeRadius), normal.z);
+    _Faces[id.xy] = float4(aboveDistance, atan(aboveTangent) * (180.0 / LOOGA_PI), belowDistance, belowDrop);
+}
+
+[numthreads(8, 8, 1)]
+void BlurFaces(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _FieldSize || (int)id.y >= _FieldSize) return;
+    float4 sum = 0;
+    float weights = 0;
+    int last = _FieldSize - 1;
+    [unroll]
+    for (int y = -2; y <= 2; y++)
+    {
+        [unroll]
+        for (int x = -2; x <= 2; x++)
+        {
+            float weight = (3 - abs(x)) * (3 - abs(y));
+            int2 texel = clamp((int2)id.xy + int2(x, y), 0, last);
+            sum += _FacesIn[texel] * weight;
+            weights += weight;
+        }
+    }
+    _Faces[id.xy] = sum / weights;
+}
+
+// The log10 area and the wetness of a flow cell. Filled cells take the upstream area of their outlet, which changes at
+// tile edges with the flow window, and their fixed wetness also marks level pads and terraces. So a filled cell has no
+// flow, and it is wet only as far as it lies in a hollow (1 = full).
+float2 LoadWater(int2 cell, int2 size, float hollow)
+{
+    float2 water = _WaterIn.Load(int3(clamp(cell, 0, size - 1), 0));
+    if (abs(water.y - FILLED_WETNESS) < 0.01)
+    {
+        water = float2(0, lerp(DRY_FILLED_WETNESS, FILLED_WETNESS, hollow));
+    }
+    return water;
+}
+
+// Bilinear sample of the flow map, with texel centres at (k + 0.5) / size.
+float2 SampleWater(float2 uv, float hollow)
+{
+    int2 size;
+    _WaterIn.GetDimensions(size.x, size.y);
+    float2 position = uv * size - 0.5;
+    int2 low = (int2)floor(position);
+    float2 blend = position - low;
+    return lerp(lerp(LoadWater(low, size, hollow), LoadWater(low + int2(1, 0), size, hollow), blend.x),
+        lerp(LoadWater(low + int2(0, 1), size, hollow), LoadWater(low + int2(1, 1), size, hollow), blend.x), blend.y);
+}
+
+[numthreads(8, 8, 1)]
+void SurfaceFields(uint3 id : SV_DispatchThreadID)
+{
+    int2 texel = _SurfaceOrigin + (int2)id.xy;
+    if (texel.x >= _SurfaceEnd.x || texel.y >= _SurfaceEnd.y) return;
+    float2 uv = (float2)texel / (_SurfaceSize - 1);
+    float2 position = uv * _FieldSize - 0.5 + _Apron;
+    float height = GroundAt(position).x;
+    float small = RelativeHeight(position, height, _SmallRadius);
+    float large = RelativeHeight(position, height, _LargeRadius);
+    float2 water = SampleWater(uv, saturate(-large / 2));
+    _Surface[texel] = saturate(float4((water.y - 2) / 13, small / 4 + 0.5, large / 16 + 0.5, water.x / 6));
+}

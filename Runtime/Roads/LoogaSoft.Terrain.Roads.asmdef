@@ -1,0 +1,11 @@
+{
+  "name": "LoogaSoft.Terrain.Roads",
+  "rootNamespace": "LoogaSoft.Terrain.Roads",
+  "references": [
+    "LoogaSoft.Terrain.Runtime",
+    "LoogaSoft.Terrain.Stamps",
+    "Unity.Mathematics",
+    "Unity.Splines"
+  ],
+  "autoReferenced": true
+}

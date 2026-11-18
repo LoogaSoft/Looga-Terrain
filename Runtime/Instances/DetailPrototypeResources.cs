@@ -27,7 +27,7 @@ namespace LoogaSoft.Terrain.Instances
             var shader = Shader.Find("Looga/Terrain/Vegetation Lit");
             if (!shader || !shader.isSupported)
             {
-                throw new NotSupportedException("The Looga vegetation shader is unavailable.");
+                throw new NotSupportedException("Texture details need the Looga/Terrain/Vegetation Lit shader from Looga Graphics Pro.");
             }
             var material = new Material(shader) { hideFlags = HideFlags.HideAndDontSave, name = "Looga texture grass" };
             _owned.Add(material);

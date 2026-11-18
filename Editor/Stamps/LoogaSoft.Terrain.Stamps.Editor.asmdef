@@ -1,0 +1,17 @@
+{
+  "name": "LoogaSoft.Terrain.Stamps.Editor",
+  "rootNamespace": "LoogaSoft.Terrain.Stamps.Editor",
+  "references": [
+    "LoogaSoft.Terrain.Runtime",
+    "LoogaSoft.Terrain.Stamps",
+    "LoogaSoft.Terrain.Instances",
+    "LoogaSoft.Instancing.Runtime",
+    "LoogaSoft.Inspector.Editor",
+    "Unity.Mathematics",
+    "Unity.Splines"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "autoReferenced": true
+}

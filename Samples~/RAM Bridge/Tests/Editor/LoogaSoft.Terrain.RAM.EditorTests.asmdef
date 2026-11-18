@@ -4,7 +4,7 @@
     "LoogaSoft.Terrain.RAM",
     "LoogaSoft.Terrain.Instances",
     "RAM",
-    "LoogaSoft.Instancing"
+    "LoogaSoft.Instancing.Runtime"
   ],
   "includePlatforms": [
     "Editor"

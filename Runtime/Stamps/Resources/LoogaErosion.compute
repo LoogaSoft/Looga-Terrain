@@ -1,0 +1,511 @@
+// Looga Stamps erosion stamp. The apron holds the heights before the stamp in heightmap texture units (see
+// LoogaHeightSmooth.compute for the apron and the target layout). The stamp erodes a world-aligned grid over its area:
+// 1. Extract: the grid heights in metres (mean of the apron texels of each cell) and the rock hardness.
+// 2. Hydraulic erosion, virtual pipe model (Mei, Decaudin and Hu 2007): rain, outflow flux to the four neighbours,
+//    water depth and velocity, erosion or deposition toward the sediment capacity of the flow, sediment transport along
+//    the velocity, evaporation.
+//    Before it, the valley pass cuts the drainage network (stream power law with transport-limited deposition): the
+//    flow goes to all lower neighbours by slope (multiple flow directions), the drainage area and the sediment load
+//    accumulate downstream by repeated gather passes, the ground erodes at a rate of the square root of the drainage
+//    area times the slope, and sediment over the carrying capacity of the flow settles, so fans form where slopes ease.
+// 3. Thermal erosion: ground steeper than the talus angle slides to its lower neighbours.
+// 4. Apply: the height change of the grid, sampled at each target texel, is added to the heights before the stamp.
+//    The fine detail of the heightmap stays.
+// All kernels only read their inputs and write their own cell, so every tile that runs the same grid gets the same
+// result.
+#pragma kernel Extract
+#pragma kernel Flux
+#pragma kernel Water
+#pragma kernel Erode
+#pragma kernel Transport
+#pragma kernel ThermalOut
+#pragma kernel ThermalIn
+#pragma kernel FlowWeights
+#pragma kernel Route
+#pragma kernel Incise
+#pragma kernel ApplyErosion
+
+#include "../Shaders/HeightStampCore.hlsl"
+#include "../Shaders/TextureStampCore.hlsl"
+
+#define GRAVITY 9.81
+
+int _TileResolution;
+int _Halo;
+int _Reach;
+int2 _TargetSize;
+Texture2D<float> _ApronIn;
+RWTexture2D<float> _Target;
+
+// Grid layout.
+int2 _GridSize;
+int2 _GridApronOffset;
+int _CellTexels;
+float _CellSize;
+// World XZ of the centre of cell (0, 0).
+float2 _GridOrigin;
+// World XZ of target texel (0, 0) and the distance between target texels, in metres.
+float2 _TargetOrigin;
+float _TexelSize;
+
+// Simulation settings. Times in seconds, lengths in metres.
+float _TimeStep;
+float _Rain;
+float _Evaporation;
+float _Capacity;
+float _Dissolve;
+float _Deposit;
+float _DepthLimit;
+float _MinimumTilt;
+float _HardnessErosion;
+float _ThermalRate;
+float _Creep;
+float _SoftTalus;
+float _HardTalus;
+float _HardnessScale;
+float _HardnessContrast;
+float _Seed;
+float _MaxChange;
+float _Strength;
+// Valley pass. Erosion rate in metres per second per (square metre ^ area exponent), capacity in cubic metres per
+// second per the same unit, deposition as the share of the excess load per second.
+float _ValleyErosion;
+float _ValleyCapacity;
+float _ValleyDeposit;
+float _AreaExponent;
+float _FlowSpread;
+
+// Drainage area (square metres) and sediment load leaving the cell (cubic metres per second).
+RWTexture2D<float2> _RouteOut;
+Texture2D<float2> _RouteIn;
+// Share of the flow of a cell to each of its eight neighbours (A = left, right, bottom, top; B = the diagonals).
+RWTexture2D<float4> _FlowA;
+RWTexture2D<float4> _FlowB;
+Texture2D<float4> _FlowAIn;
+Texture2D<float4> _FlowBIn;
+// Slope to the steepest lower neighbour.
+RWTexture2D<float> _Steepest;
+Texture2D<float> _SteepestIn;
+
+RWTexture2D<float> _Ground;
+Texture2D<float> _GroundIn;
+RWTexture2D<float> _Initial;
+Texture2D<float> _InitialIn;
+RWTexture2D<float> _Hardness;
+Texture2D<float> _HardnessIn;
+RWTexture2D<float> _WaterOut;
+Texture2D<float> _WaterIn;
+// Outflow flux to the left (-x), right (+x), bottom (-y) and top (+y) neighbours, in cubic metres per second.
+RWTexture2D<float4> _FluxOut;
+Texture2D<float4> _FluxIn;
+RWTexture2D<float2> _VelocityOut;
+Texture2D<float2> _VelocityIn;
+RWTexture2D<float> _SedimentOut;
+Texture2D<float> _SedimentIn;
+// Thermal outflow to the eight neighbours: A = left, right, bottom, top; B = the diagonals in NeighbourOffset order.
+RWTexture2D<float4> _ThermalA;
+RWTexture2D<float4> _ThermalB;
+Texture2D<float4> _ThermalAIn;
+Texture2D<float4> _ThermalBIn;
+SamplerState sampler_LinearClamp;
+
+static const int2 NeighbourOffset[8] =
+{
+    int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1),
+    int2(-1, -1), int2(1, -1), int2(-1, 1), int2(1, 1)
+};
+// Index of the opposite direction: left <-> right, bottom <-> top, and the diagonals likewise.
+static const int OppositeSide[8] = { 1, 0, 3, 2, 7, 6, 5, 4 };
+
+bool InGrid(int2 cell)
+{
+    return all(cell >= 0) && all(cell < _GridSize);
+}
+
+int2 ClampCell(int2 cell)
+{
+    return clamp(cell, 0, _GridSize - 1);
+}
+
+// Integer hash (pcg3d), 0 to 1. Integers keep it exact far from the world origin.
+float Hash3(int3 p)
+{
+    uint3 v = uint3(p) * 1664525u + 1013904223u;
+    v.x += v.y * v.z;
+    v.y += v.z * v.x;
+    v.z += v.x * v.y;
+    v ^= v >> 16u;
+    v.x += v.y * v.z;
+    v.y += v.z * v.x;
+    v.z += v.x * v.y;
+    return float(v.x) * (1.0 / 4294967296.0);
+}
+
+float ValueNoise3(float3 p)
+{
+    float3 cell = floor(p);
+    float3 f = p - cell;
+    f = f * f * (3 - 2 * f);
+    int3 c = (int3)cell;
+    float x00 = lerp(Hash3(c), Hash3(c + int3(1, 0, 0)), f.x);
+    float x10 = lerp(Hash3(c + int3(0, 1, 0)), Hash3(c + int3(1, 1, 0)), f.x);
+    float x01 = lerp(Hash3(c + int3(0, 0, 1)), Hash3(c + int3(1, 0, 1)), f.x);
+    float x11 = lerp(Hash3(c + int3(0, 1, 1)), Hash3(c + int3(1, 1, 1)), f.x);
+    return lerp(lerp(x00, x10, f.y), lerp(x01, x11, f.y), f.z);
+}
+
+// Rock hardness from 0 (soft) to 1 (hard) at a world position: four octaves of 3D value noise, so it changes along the
+// ground and with the height, without layers.
+float RockHardness(float3 world)
+{
+    float3 p = world / max(_HardnessScale, 0.1) + _Seed * 17.31;
+    float sum = 0;
+    float amplitude = 0.5;
+    float total = 0;
+    for (int octave = 0; octave < 4; octave++)
+    {
+        sum += ValueNoise3(p) * amplitude;
+        total += amplitude;
+        p = p * 2.03 + 11.7;
+        amplitude *= 0.5;
+    }
+    return saturate((sum / total - 0.5) * _HardnessContrast + 0.5);
+}
+
+[numthreads(8, 8, 1)]
+void Extract(uint3 id : SV_DispatchThreadID)
+{
+    int2 cell = (int2)id.xy;
+    if (!InGrid(cell)) return;
+    int2 first = _GridApronOffset + cell * _CellTexels;
+    float sum = 0;
+    for (int y = 0; y < _CellTexels; y++)
+    {
+        for (int x = 0; x < _CellTexels; x++)
+        {
+            sum += _ApronIn[first + int2(x, y)];
+        }
+    }
+    float height = _TerrainHeight + sum / (_CellTexels * _CellTexels) * _RealHeight;
+    _Ground[cell] = height;
+    _Initial[cell] = height;
+    float2 world = _GridOrigin + cell * _CellSize;
+    _Hardness[cell] = RockHardness(float3(world.x, height, world.y));
+    _WaterOut[cell] = 0;
+    _FluxOut[cell] = 0;
+    _VelocityOut[cell] = 0;
+    _SedimentOut[cell] = 0;
+    _RouteOut[cell] = 0;
+}
+
+// Water of a cell after the rain of this step. Past the grid edge the ground has the height of the edge cell and no
+// water, so water flows out over the edge.
+float RainedWater(int2 cell)
+{
+    return InGrid(cell) ? _WaterIn[cell] + _TimeStep * _Rain : 0;
+}
+
+[numthreads(8, 8, 1)]
+void Flux(uint3 id : SV_DispatchThreadID)
+{
+    int2 cell = (int2)id.xy;
+    if (!InGrid(cell)) return;
+    float ground = _GroundIn[cell];
+    float water = RainedWater(cell);
+    float level = ground + water;
+    float4 flux = _FluxIn[cell];
+    float4 outflow;
+    [unroll] for (int side = 0; side < 4; side++)
+    {
+        int2 neighbour = cell + NeighbourOffset[side];
+        float neighbourLevel = _GroundIn[ClampCell(neighbour)] + RainedWater(neighbour);
+        // Pipe cross section = cell area, pipe length = cell size.
+        outflow[side] = max(0, flux[side] + _TimeStep * _CellSize * GRAVITY * (level - neighbourLevel));
+    }
+    // A cell cannot give more water than it has.
+    float total = outflow.x + outflow.y + outflow.z + outflow.w;
+    float scale = total > 0 ? min(1, water * _CellSize * _CellSize / (total * _TimeStep)) : 0;
+    _FluxOut[cell] = outflow * scale;
+}
+
+// Flux from a neighbour into the cell. side = the side of the cell that the neighbour is on.
+float Inflow(int2 cell, int side)
+{
+    int2 neighbour = cell + NeighbourOffset[side];
+    if (!InGrid(neighbour)) return 0;
+    // The neighbour on the left sends to its right, and so on.
+    int opposite = side ^ 1;
+    return _FluxIn[neighbour][opposite];
+}
+
+[numthreads(8, 8, 1)]
+void Water(uint3 id : SV_DispatchThreadID)
+{
+    int2 cell = (int2)id.xy;
+    if (!InGrid(cell)) return;
+    float before = RainedWater(cell);
+    float4 outflow = _FluxIn[cell];
+    float4 inflow = float4(Inflow(cell, 0), Inflow(cell, 1), Inflow(cell, 2), Inflow(cell, 3));
+    float change = (inflow.x + inflow.y + inflow.z + inflow.w) - (outflow.x + outflow.y + outflow.z + outflow.w);
+    float after = max(0, before + _TimeStep * change / (_CellSize * _CellSize));
+    _WaterOut[cell] = after;
+    // Mean flow through the cell in x and y, per metre of width and per metre of depth.
+    float mean = 0.5 * (before + after);
+    float2 through = 0.5 * float2(inflow.x - outflow.x + outflow.y - inflow.y, inflow.z - outflow.z + outflow.w - inflow.w);
+    _VelocityOut[cell] = mean > 1e-4 ? through / (_CellSize * mean) : 0;
+}
+
+[numthreads(8, 8, 1)]
+void Erode(uint3 id : SV_DispatchThreadID)
+{
+    int2 cell = (int2)id.xy;
+    if (!InGrid(cell)) return;
+    float ground = _GroundIn[cell];
+    float2 gradient = float2(
+        _GroundIn[ClampCell(cell + int2(1, 0))] - _GroundIn[ClampCell(cell - int2(1, 0))],
+        _GroundIn[ClampCell(cell + int2(0, 1))] - _GroundIn[ClampCell(cell - int2(0, 1))]) / (2 * _CellSize);
+    float slope = length(gradient);
+    float sine = slope / sqrt(1 + slope * slope);
+    float water = _WaterIn[cell];
+    float speed = length(_VelocityIn[cell]);
+    float capacity = _Capacity * max(sine, _MinimumTilt) * speed * saturate(water / max(_DepthLimit, 1e-4));
+    float sediment = _SedimentIn[cell];
+    float hardness = _HardnessIn[cell];
+    if (capacity > sediment)
+    {
+        // Hard rock gives less material.
+        float amount = _TimeStep * _Dissolve * (capacity - sediment) * (1 - _HardnessErosion * hardness);
+        ground -= amount;
+        sediment += amount;
+    }
+    else
+    {
+        float amount = _TimeStep * _Deposit * (sediment - capacity);
+        ground += amount;
+        sediment -= amount;
+    }
+    // The total change stays within the largest change of the stamp.
+    float initial = _InitialIn[cell];
+    _Ground[cell] = clamp(ground, initial - _MaxChange, initial + _MaxChange);
+    _SedimentOut[cell] = sediment;
+}
+
+[numthreads(8, 8, 1)]
+void Transport(uint3 id : SV_DispatchThreadID)
+{
+    int2 cell = (int2)id.xy;
+    if (!InGrid(cell)) return;
+    // The sediment at a cell comes from where the flow was one step earlier.
+    float2 from = cell - _VelocityIn[cell] * _TimeStep / _CellSize;
+    float2 uv = (from + 0.5) / _GridSize;
+    _SedimentOut[cell] = _SedimentIn.SampleLevel(sampler_LinearClamp, uv, 0);
+    _WaterOut[cell] = _WaterIn[cell] * max(0, 1 - _Evaporation * _TimeStep);
+}
+
+float TalusDrop(int2 cell, int side, float ground, float talus)
+{
+    int2 neighbour = cell + NeighbourOffset[side];
+    if (!InGrid(neighbour)) return 0;
+    float distance = side < 4 ? _CellSize : _CellSize * 1.41421356;
+    return max(0, ground - _GroundIn[neighbour] - distance * talus);
+}
+
+[numthreads(8, 8, 1)]
+void ThermalOut(uint3 id : SV_DispatchThreadID)
+{
+    int2 cell = (int2)id.xy;
+    if (!InGrid(cell)) return;
+    float ground = _GroundIn[cell];
+    float talus = tan(radians(lerp(_SoftTalus, _HardTalus, _HardnessIn[cell])));
+    float4 a;
+    float4 b;
+    [unroll] for (int side = 0; side < 4; side++)
+    {
+        a[side] = TalusDrop(cell, side, ground, talus);
+        b[side] = TalusDrop(cell, side + 4, ground, talus);
+    }
+    float total = dot(a, 1) + dot(b, 1);
+    float largest = max(max(max(a.x, a.y), max(a.z, a.w)), max(max(b.x, b.y), max(b.z, b.w)));
+    // Half of the largest excess moves, shared by the excess to each neighbour, so the cell never drops below them.
+    float moved = _ThermalRate * _TimeStep * 0.5 * largest;
+    float scale = total > 0 ? moved / total : 0;
+    _ThermalA[cell] = a * scale;
+    _ThermalB[cell] = b * scale;
+}
+
+float ThermalFrom(int2 cell, int side)
+{
+    int2 neighbour = cell + NeighbourOffset[side];
+    if (!InGrid(neighbour)) return 0;
+    int opposite = OppositeSide[side];
+    return opposite < 4 ? _ThermalAIn[neighbour][opposite] : _ThermalBIn[neighbour][opposite - 4];
+}
+
+[numthreads(8, 8, 1)]
+void ThermalIn(uint3 id : SV_DispatchThreadID)
+{
+    int2 cell = (int2)id.xy;
+    if (!InGrid(cell)) return;
+    float gained = 0;
+    [unroll] for (int side = 0; side < 8; side++)
+    {
+        gained += ThermalFrom(cell, side);
+    }
+    float lost = dot(_ThermalAIn[cell], 1) + dot(_ThermalBIn[cell], 1);
+    // Soil creep: the ground diffuses down its slope (rate in square metres per second). Creep against channel cutting
+    // sets how far apart the gullies form: more creep gives fewer, wider gullies.
+    float ground = _GroundIn[cell];
+    float laplacian = (_GroundIn[ClampCell(cell + int2(1, 0))] + _GroundIn[ClampCell(cell - int2(1, 0))] +
+        _GroundIn[ClampCell(cell + int2(0, 1))] + _GroundIn[ClampCell(cell - int2(0, 1))] - 4 * ground) /
+        (_CellSize * _CellSize);
+    float creep = min(_Creep * _TimeStep, 0.2 * _CellSize * _CellSize) * laplacian;
+    float initial = _InitialIn[cell];
+    _Ground[cell] = clamp(ground + gained - lost + creep, initial - _MaxChange, initial + _MaxChange);
+}
+
+float NeighbourDistance(int side)
+{
+    return side < 4 ? _CellSize : _CellSize * 1.41421356;
+}
+
+[numthreads(8, 8, 1)]
+void FlowWeights(uint3 id : SV_DispatchThreadID)
+{
+    int2 cell = (int2)id.xy;
+    if (!InGrid(cell)) return;
+    float ground = _GroundIn[cell];
+    float drops[8];
+    float total = 0;
+    float steepest = 0;
+    int lowest = 0;
+    float lowestGround = 1e9;
+    [unroll] for (int side = 0; side < 8; side++)
+    {
+        int2 neighbour = cell + NeighbourOffset[side];
+        // Past the grid edge the ground continues at the height of the edge cell.
+        float other = _GroundIn[ClampCell(neighbour)];
+        float slope = (ground - other) / NeighbourDistance(side);
+        drops[side] = InGrid(neighbour) && slope > 0 ? pow(max(slope, 1e-6), _FlowSpread) : 0;
+        total += drops[side];
+        steepest = max(steepest, InGrid(neighbour) ? slope : 0);
+        if (InGrid(neighbour) && other < lowestGround)
+        {
+            lowestGround = other;
+            lowest = side;
+        }
+    }
+    float4 a = 0;
+    float4 b = 0;
+    [unroll] for (int k = 0; k < 4; k++)
+    {
+        a[k] = total > 0 ? drops[k] / total : (lowest == k ? 1 : 0);
+        b[k] = total > 0 ? drops[k + 4] / total : (lowest == k + 4 ? 1 : 0);
+    }
+    // A pit sends its flow on to its lowest neighbour, so the drainage does not end in small hollows.
+    _FlowA[cell] = a;
+    _FlowB[cell] = b;
+    _Steepest[cell] = steepest;
+}
+
+// Flow share that a neighbour sends to the cell. side = the side of the cell that the neighbour is on.
+float FlowFrom(int2 cell, int side)
+{
+    int2 neighbour = cell + NeighbourOffset[side];
+    if (!InGrid(neighbour)) return 0;
+    int opposite = OppositeSide[side];
+    return opposite < 4 ? _FlowAIn[neighbour][opposite] : _FlowBIn[neighbour][opposite - 4];
+}
+
+// Drainage area and sediment load that flow into the cell.
+float2 RouteInflow(int2 cell)
+{
+    float2 inflow = 0;
+    [unroll] for (int side = 0; side < 8; side++)
+    {
+        float share = FlowFrom(cell, side);
+        if (share > 0) inflow += _RouteIn[cell + NeighbourOffset[side]] * share;
+    }
+    return inflow;
+}
+
+// Erosion and deposition of the valley pass, in metres per second, for the drainage area and load into a cell.
+float2 ValleyRates(int2 cell, float area, float loadIn)
+{
+    float cellArea = _CellSize * _CellSize;
+    float stream = pow(max(area, 1e-6), _AreaExponent) * _SteepestIn[cell];
+    float capacity = _ValleyCapacity * stream;
+    float erodibility = 1 - _HardnessErosion * _HardnessIn[cell];
+    float erode = loadIn < capacity ? min(_ValleyErosion * stream * erodibility, (capacity - loadIn) / cellArea) : 0;
+    float deposit = _ValleyDeposit * max(0, loadIn - capacity) / cellArea;
+    return float2(erode, deposit);
+}
+
+[numthreads(8, 8, 1)]
+void Route(uint3 id : SV_DispatchThreadID)
+{
+    int2 cell = (int2)id.xy;
+    if (!InGrid(cell)) return;
+    float cellArea = _CellSize * _CellSize;
+    float2 inflow = RouteInflow(cell);
+    float area = cellArea + inflow.x;
+    float2 rates = ValleyRates(cell, area, inflow.y);
+    _RouteOut[cell] = float2(area, max(0, inflow.y + (rates.x - rates.y) * cellArea));
+}
+
+[numthreads(8, 8, 1)]
+void Incise(uint3 id : SV_DispatchThreadID)
+{
+    int2 cell = (int2)id.xy;
+    if (!InGrid(cell)) return;
+    float ground = _GroundIn[cell];
+    float2 inflow = RouteInflow(cell);
+    float area = _CellSize * _CellSize + inflow.x;
+    float2 rates = ValleyRates(cell, area, inflow.y);
+    float change = (rates.y - rates.x) * _TimeStep;
+    // A step never cuts below the lowest neighbour, and a deposit only fills toward the mean of the neighbours, so no
+    // pits, spikes or alternating cells form. A step changes the ground by at most a quarter cell.
+    float lowest = 1e9;
+    float mean = 0;
+    float count = 0;
+    [unroll] for (int side = 0; side < 8; side++)
+    {
+        int2 neighbour = cell + NeighbourOffset[side];
+        if (!InGrid(neighbour)) continue;
+        float other = _GroundIn[neighbour];
+        lowest = min(lowest, other);
+        mean += other;
+        count += 1;
+    }
+    mean /= max(count, 1);
+    change = clamp(change, -0.5 * max(0, ground - lowest), 0.5 * max(0, mean - ground));
+    change = clamp(change, -0.25 * _CellSize, 0.25 * _CellSize);
+    float initial = _InitialIn[cell];
+    _Ground[cell] = clamp(ground + change, initial - _MaxChange, initial + _MaxChange);
+}
+
+[numthreads(8, 8, 1)]
+void ApplyErosion(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _TargetSize)) return;
+    float height = _ApronIn[(int2)id.xy + _Reach];
+    float2 tileUv = (float2((int2)id.xy - _Halo) + 0.5) / _TileResolution;
+    float2 stampUv = mul(_TileToStamp, float4(tileUv, 0, 1)).xy;
+    float2 world = _TargetOrigin + (float2)id.xy * _TexelSize;
+    float2 gridUv = ((world - _GridOrigin) / _CellSize + 0.5) / _GridSize;
+    if (any(stampUv < 0) || any(stampUv > 1) || any(gridUv < 0) || any(gridUv > 1))
+    {
+        _Target[id.xy] = height;
+        return;
+    }
+    FalloffInput input;
+    input.stampUv = stampUv;
+    input.stampUvDx = _TileToStamp._m00_m10 / _TileResolution;
+    input.stampUvDy = _TileToStamp._m01_m11 / _TileResolution;
+    input.tileUv = tileUv;
+    input.worldNoiseUv = NoiseUv(tileUv);
+    float weight = StampFalloff(input, _RealHeight) * _Strength;
+    float change = _GroundIn.SampleLevel(sampler_LinearClamp, gridUv, 0) -
+        _InitialIn.SampleLevel(sampler_LinearClamp, gridUv, 0);
+    change = clamp(change, -_MaxChange, _MaxChange);
+    _Target[id.xy] = clamp(height + change / _RealHeight * weight, 0, MAXIMUM_HEIGHT);
+}

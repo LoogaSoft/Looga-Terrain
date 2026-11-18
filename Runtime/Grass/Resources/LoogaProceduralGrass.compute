@@ -1,0 +1,397 @@
+// Places procedural grass blades for ProceduralGrassRenderer. One lane is one lattice point of a camera tile.
+#pragma kernel ClearCounters
+#pragma kernel Generate
+#pragma kernel WriteArguments
+
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+#include "Packages/com.loogasoft.loogaterrain/Runtime/Shaders/Surface/LoogaTerrainSurfaceWorld.hlsl"
+#include "Packages/com.loogasoft.loogaterrain/Runtime/Shaders/Grass/ProceduralGrassCommon.hlsl"
+
+// The offset keeps lattice indices positive, so the lowest set bit gives the lattice level.
+#define GRASS_LATTICE_OFFSET 4194304
+#define GRASS_MAXIMUM_TYPES 8
+
+// 0 near count, 1 far count, 2 near count in capacity, 3 far count in capacity.
+RWStructuredBuffer<uint> _GrassCounters;
+RWStructuredBuffer<uint> _GrassArguments;
+StructuredBuffer<int4> _GrassTiles;
+StructuredBuffer<GrassType> _GrassTypes;
+RWStructuredBuffer<GrassBlade> _GrassBlades;
+Texture2D<float4> _GrassHeightmap;
+Texture2D<float4> _GrassHoles;
+Texture2DArray<float4> _GrassCoverage;
+// Ground parts of meshes, such as cliff wall tops, drawn from above (GrassGroundMap): ground height, and the offset to
+// the terrain point whose ground they show.
+Texture2D<float> _GrassGroundHeight;
+// xy: offset to the terrain point whose ground the mesh shows. z: grass density of the ground.
+Texture2D<float4> _GrassGroundOffset;
+SamplerState sampler_linear_clamp;
+SamplerState sampler_point_clamp;
+
+float4 _GrassCamera;
+float4 _GrassPlanes[6];
+float4 _GrassDistances;     // Cell size, full density distance, blade distance, fade share.
+float4 _GrassDetail;        // Level of detail distance, width compensation, ring count, type count.
+float4 _GrassPixels;        // World size of one pixel per meter, minimum blade width in pixels, width thinning.
+float4 _GrassTerrainOrigin; // World origin, heightmap resolution.
+float4 _GrassTerrainSize;   // World size, height scale of the heightmap texture.
+float4 _GrassGroundArea;    // World X and Z of the ground map origin, texel size, 1 when the map holds ground.
+float4 _GrassGroundTexels;  // Texel counts of the ground map along X and Z.
+int _GrassNearCapacity;
+int _GrassFarCapacity;
+int _GrassTileOffset;
+int _GrassNearIndexCount;
+int _GrassFarIndexCount;
+
+[numthreads(1, 1, 1)]
+void ClearCounters()
+{
+    _GrassCounters[0] = 0;
+    _GrassCounters[1] = 0;
+    _GrassCounters[2] = 0;
+    _GrassCounters[3] = 0;
+}
+
+float GrassHeight(float2 uv)
+{
+    float resolution = _GrassTerrainOrigin.w;
+    float2 texel = (saturate(uv) * (resolution - 1.0) + 0.5) / resolution;
+    return _GrassTerrainOrigin.y + _GrassHeightmap.SampleLevel(sampler_linear_clamp, texel, 0).r * _GrassTerrainSize.w;
+}
+
+// Height of a ground map texel without ground (GrassGroundMap.NoGround).
+#define GRASS_NO_GROUND -1e5
+// Mesh ground that lies this far under the terrain is hidden, so the terrain grows the grass there.
+#define GRASS_GROUND_UNDER_TERRAIN 0.1
+// Largest height change of a blade that its clump moves between mesh ground and terrain, in meters.
+#define GRASS_GROUND_STEP 0.3
+// Largest height difference of four texels that the ground height blends over, in meters. Larger differences are
+// ledges, which keep the nearest texel.
+#define GRASS_GROUND_BLEND_STEP 1.5
+
+// The ground map texel at a position. False outside the map.
+bool GrassGroundTexel(float2 positionXZ, out int2 texel)
+{
+    texel = (int2)floor((positionXZ - _GrassGroundArea.xy) / _GrassGroundArea.z);
+    return _GrassGroundArea.w > 0.5 && all(texel >= 0) && all(texel < (int2)_GrassGroundTexels.xy);
+}
+
+// Height of the mesh ground at a texel, or GRASS_NO_GROUND.
+float GrassGroundHeightAt(int2 texel)
+{
+    return all(texel >= 0) && all(texel < (int2)_GrassGroundTexels.xy)
+        ? _GrassGroundHeight.Load(int3(texel, 0))
+        : GRASS_NO_GROUND;
+}
+
+// The mesh ground at a position that is not hidden under the terrain: its height, the offset to the terrain point
+// whose ground it shows and its grass density. The ground edge uses the nearest texel, so a blade stands at most half a texel past it.
+// Inside the ground the height blends between the four nearest texels, so blades on a sloped top, such as the rounded
+// rim of a rock, follow the slope and do not stand in steps of one texel.
+bool GrassGroundAt(float2 positionXZ, float2 terrainUV, out float height, out float2 offset, out float density)
+{
+    height = 0.0;
+    offset = 0.0;
+    density = 1.0;
+    int2 texel;
+    if (!GrassGroundTexel(positionXZ, texel)) return false;
+    height = GrassGroundHeightAt(texel);
+    if (height < GRASS_NO_GROUND * 0.5 || height < GrassHeight(terrainUV) - GRASS_GROUND_UNDER_TERRAIN) return false;
+    float4 ground = _GrassGroundOffset.Load(int3(texel, 0));
+    offset = ground.xy;
+    density = ground.z;
+    float2 cell = (positionXZ - _GrassGroundArea.xy) / _GrassGroundArea.z - 0.5;
+    int2 corner = (int2)floor(cell);
+    float2 blend = cell - (float2)corner;
+    float h00 = GrassGroundHeightAt(corner);
+    float h10 = GrassGroundHeightAt(corner + int2(1, 0));
+    float h01 = GrassGroundHeightAt(corner + int2(0, 1));
+    float h11 = GrassGroundHeightAt(corner + int2(1, 1));
+    float lowest = min(min(h00, h10), min(h01, h11));
+    float highest = max(max(h00, h10), max(h01, h11));
+    if (lowest > GRASS_NO_GROUND * 0.5 && highest - lowest < GRASS_GROUND_BLEND_STEP)
+    {
+        height = lerp(lerp(h00, h10, blend.x), lerp(h01, h11, blend.x), blend.y);
+    }
+    return true;
+}
+
+// Normal of the mesh ground from the next texels. A side without ground uses the texel itself.
+float3 GrassGroundNormal(float2 positionXZ, float height)
+{
+    int2 texel;
+    GrassGroundTexel(positionXZ, texel);
+    float heights[4];
+    int2 steps[4] = { int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
+    for (int index = 0; index < 4; index++)
+    {
+        float neighbour = GrassGroundHeightAt(texel + steps[index]);
+        heights[index] = neighbour < GRASS_NO_GROUND * 0.5 ? height : neighbour;
+    }
+    float span = 2.0 * _GrassGroundArea.z;
+    return normalize(float3((heights[0] - heights[1]) / span, 1.0, (heights[2] - heights[3]) / span));
+}
+
+// The world color map at a position, packed. 0 where no map covers it.
+uint GrassWorldColor(float2 positionXZ)
+{
+    if (_LoogaWorldColorState.x < 0.5) return 0;
+    float4 coord = LoogaWorldColorCoord(positionXZ);
+    if (coord.w < 0.5) return 0;
+    float3 color = _LoogaWorldColorState.x > 1.5
+        ? SAMPLE_TEXTURE2D_ARRAY_LOD(_LoogaWorldColorTiles, sampler_LoogaWorldColorTiles, coord.xy, coord.z, 0).rgb
+        : SAMPLE_TEXTURE2D_LOD(_LoogaWorldColorMap, sampler_LoogaWorldColorMap, coord.xy, 0).rgb;
+    return GrassPackColor(color * _LoogaWorldColorState.y);
+}
+
+uint GrassCellHash(int2 cell, uint salt)
+{
+    return GrassHash(uint(cell.x + GRASS_LATTICE_OFFSET) ^ GrassHash(uint(cell.y + GRASS_LATTICE_OFFSET) ^ salt));
+}
+
+// Smooth value noise from 0 to 1 over cells of one unit: a cubic blend of the hashed values of the four cell corners.
+float GrassValueNoise(float2 position, uint salt)
+{
+    int2 cell = (int2)floor(position);
+    float2 f = position - floor(position);
+    float2 u = f * f * (3.0 - 2.0 * f);
+    float a = (GrassCellHash(cell, salt) & 0xFFFFu) / 65535.0;
+    float b = (GrassCellHash(cell + int2(1, 0), salt) & 0xFFFFu) / 65535.0;
+    float c = (GrassCellHash(cell + int2(0, 1), salt) & 0xFFFFu) / 65535.0;
+    float d = (GrassCellHash(cell + int2(1, 1), salt) & 0xFFFFu) / 65535.0;
+    return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y);
+}
+
+// Length factor of the patch at a position: taller grass that rises out of a closed mat. Two octaves, so the patch
+// edges are irregular. The sum stays near its mean, so it is stretched to reach about -1 to 1. Tall patches grow by up
+// to 1.5 x the strength; low patches shrink only by 0.35 x, because short grass let the ground show as bald spots.
+float GrassPatchFactor(float2 position, GrassType type)
+{
+    if (type.patches.x <= 0.0) return 1.0;
+    float2 p = position * type.patches.y;
+    float noise = 0.65 * GrassValueNoise(p, 0x68E31DA4u) + 0.35 * GrassValueNoise(p * 2.7 + 17.3, 0xB5297A4Du);
+    float level = clamp((noise - 0.5) * 3.0, -1.0, 1.0);
+    return 1.0 + type.patches.x * level * (level > 0.0 ? 1.5 : 0.35);
+}
+
+[numthreads(8, 8, 1)]
+void Generate(uint3 id : SV_DispatchThreadID)
+{
+    int4 tile = _GrassTiles[_GrassTileOffset + id.z];
+    int2 lattice = tile.xy + int2(id.xy) * (1 << tile.z);
+    uint2 key = uint2(lattice + GRASS_LATTICE_OFFSET);
+    int ringCount = (int)_GrassDetail.z;
+
+    // Points on a coarse lattice stay visible farther away. Each farther octave keeps one point in four. Each point
+    // ends at a random distance within its octave, so the density falls smoothly and shows no rings.
+    int level = min((int)min(firstbitlow(key.x), firstbitlow(key.y)), ringCount - 1);
+    float fullDistance = _GrassDistances.y;
+    uint fadeSeed = GrassCellHash(lattice, 0x632BE5ABu);
+    float octave = GrassRandom(fadeSeed);
+    float visible = level >= ringCount - 1
+        ? _GrassDistances.z * exp2(octave - 1.0)
+        : min(fullDistance * exp2(level + octave), _GrassDistances.z);
+
+    uint seed = GrassCellHash(lattice, 0x9E3779B9u);
+    float2 jitter = float2(GrassRandom(seed), GrassRandom(seed)) - 0.5;
+    float2 position = (float2(lattice) + 0.5 + jitter) * _GrassDistances.x;
+    float2 toCamera = position - _GrassCamera.xz;
+    if (dot(toCamera, toCamera) > visible * visible) return;
+    float2 local = position - _GrassTerrainOrigin.xz;
+    if (any(local < 0.0) || any(local >= _GrassTerrainSize.xz)) return;
+    float2 uv = local / _GrassTerrainSize.xz;
+    float2 startUV = uv;
+
+    // On the ground of a mesh, such as a cliff wall top, the grass is that of the terrain point whose ground the mesh
+    // shows. The terrain under the mesh can be a steep face without grass.
+    float groundHeight;
+    float2 groundOffset;
+    float groundDensity;
+    bool onGround = GrassGroundAt(position, uv, groundHeight, groundOffset, groundDensity);
+    if (!onGround) groundDensity = 1.0;
+    float2 coverageUV = onGround
+        ? saturate((position + groundOffset - _GrassTerrainOrigin.xz) / _GrassTerrainSize.xz)
+        : uv;
+
+    // The coverage of each type gives its weight. A weighted random pick hides the detail texels.
+    // ProceduralGrassType.BladeShare and BladeFootprint repeat the weight and the length rules for ground tools.
+    int typeCount = (int)_GrassDetail.w;
+    float weights[GRASS_MAXIMUM_TYPES];
+    float total = 0.0;
+    float fullest = 0.0;
+    for (int index = 0; index < typeCount; index++)
+    {
+        float coverage = _GrassCoverage.SampleLevel(sampler_linear_clamp, float3(coverageUV, index), 0).r;
+        GrassType candidate = _GrassTypes[index];
+        // A ground density under 1 (the edge of masked mesh ground) thins the grass as a smaller coverage does.
+        float typeFullness = saturate(coverage / max(candidate.shape.w, 0.0001)) * groundDensity;
+        weights[index] = typeFullness * candidate.bend.w;
+        total += weights[index];
+        if (weights[index] > 0.0) fullest = max(fullest, typeFullness);
+    }
+    if (total <= 0.0) return;
+    // Thin grass grows in tufts, as real grass does, and not as single blades. The lattice share of the types thins
+    // the blades evenly. A coverage under the full coverage thins whole clumps and the clump rims (tufts, below). At
+    // the full coverage, tufts is 1 and the pick is the same as before.
+    float latticeShare = min(total / fullest, 1.0);
+    float tufts = min(total, 1.0) / latticeShare;
+    float pick = GrassRandom(seed);
+    if (pick >= latticeShare) return;
+    pick *= tufts;
+    int typeIndex = 0;
+    float sum = 0.0;
+    for (int candidateIndex = 0; candidateIndex < typeCount; candidateIndex++)
+    {
+        sum += weights[candidateIndex];
+        typeIndex = candidateIndex;
+        if (pick < sum) break;
+    }
+    GrassType type = _GrassTypes[typeIndex];
+    float fullness = saturate(weights[typeIndex] / max(type.bend.w, 0.0001));
+
+    // Voronoi clumps: the nearest of the 3 x 3 jittered clump points owns the blade.
+    float clumpSize = type.clump.x;
+    int2 clumpBase = (int2)floor(position / clumpSize);
+    float nearest = 1e20;
+    float2 clumpCentre = position;
+    uint clumpSeed = 0;
+    for (int z = -1; z <= 1; z++)
+    {
+        for (int x = -1; x <= 1; x++)
+        {
+            int2 cell = clumpBase + int2(x, z);
+            uint hash = GrassCellHash(cell, 0x85EBCA6Bu * (uint)(typeIndex + 1));
+            float2 clumpPoint = (float2(cell) + float2(hash & 0xFFFFu, hash >> 16) / 65535.0) * clumpSize;
+            float2 offset = clumpPoint - position;
+            float distanceSquared = dot(offset, offset);
+            if (distanceSquared < nearest)
+            {
+                nearest = distanceSquared;
+                clumpCentre = clumpPoint;
+                clumpSeed = hash;
+            }
+        }
+    }
+    float clumpValue = GrassRandom(clumpSeed);
+    float clumpAngle = GrassRandom(clumpSeed) * 6.2831853;
+    // Thin grass keeps the share tufts ^ clumping of the clumps, by a random rank of each clump, and in each kept clump
+    // the share tufts ^ (1 - clumping) of its area nearest the centre. The product keeps the share tufts of the blades.
+    // The rim test has a random spread, so the tufts are not round.
+    if (tufts < 1.0)
+    {
+        float clumping = type.detail.w;
+        uint tuftSeed = clumpSeed ^ 0x2C1B3C6Du;
+        if (GrassRandom(tuftSeed) >= exp2(log2(tufts) * clumping)) return;
+        float rimLimit = exp2(log2(tufts) * (1.0 - clumping));
+        // A disc with the area of a clump cell has the radius 0.564 x clump size, so this share is near uniform.
+        uint rimSeed = GrassCellHash(lattice, 0x165667B1u);
+        float rim = saturate(nearest / (0.318 * clumpSize * clumpSize) + (GrassRandom(rimSeed) - 0.5) * 0.3);
+        if (rimLimit < 1.0 && rim >= rimLimit) return;
+    }
+    position = lerp(position, clumpCentre, type.clump.w * 0.6);
+    local = position - _GrassTerrainOrigin.xz;
+    if (any(local < 0.0) || any(local >= _GrassTerrainSize.xz)) return;
+    uv = local / _GrassTerrainSize.xz;
+    float startHeight = groundHeight;
+    float2 movedOffset;
+    float movedDensity;
+    bool movedOnGround = GrassGroundAt(position, uv, groundHeight, movedOffset, movedDensity);
+    float terrainHeight = GrassHeight(uv);
+    if (!movedOnGround && _GrassHoles.SampleLevel(sampler_point_clamp, uv, 0).r < 0.5) return;
+    float3 root = float3(position.x, movedOnGround ? max(terrainHeight, groundHeight) : terrainHeight, position.y);
+    // A clump that moves a blade between the ground of a mesh and the terrain drops it where the two differ in
+    // height, so no blade hangs over the edge of a cliff wall. Where the wall top lies on the terrain, the blade stays,
+    // else the clumps along the inner edge of the top had gaps.
+    if (movedOnGround != onGround)
+    {
+        float before = onGround ? startHeight : GrassHeight(startUV);
+        if (abs(root.y - before) > GRASS_GROUND_STEP) return;
+    }
+    float cameraDistance = length(root - _GrassCamera.xyz);
+    if (cameraDistance > visible) return;
+    float fade = smoothstep(visible, visible * (1.0 - _GrassDistances.w), cameraDistance);
+    // The vertex shader widens blades that are narrower on screen than the minimum pixel width, so no blade gets
+    // thinner than it. TAA cannot resolve thinner blades and shows them as static. The widening adds coverage. With
+    // full width thinning only the share natural width / minimum width of those blades stays, so the field keeps its
+    // coverage. Each blade has its own threshold and shrinks before it ends, so the thinning does not pop.
+    float meanWidth = type.shape.z * pow(max(1.0, cameraDistance / fullDistance), _GrassDetail.y);
+    float keep = pow(saturate(meanWidth / max(_GrassPixels.x * _GrassPixels.y * cameraDistance, 1e-6)), _GrassPixels.z);
+    if (keep < 1.0)
+    {
+        uint thinSeed = GrassCellHash(lattice, 0x27D4EB2Fu);
+        float threshold = GrassRandom(thinSeed);
+        if (threshold >= keep) return;
+        fade *= smoothstep(threshold, min(threshold * (1.0 + _GrassDistances.w), 1.0), keep);
+    }
+    float height = lerp(type.shape.x, type.shape.y, GrassRandom(seed));
+    height *= 1.0 + type.clump.y * (clumpValue * 2.0 - 1.0);
+    // The clump centre picks the patch, so all blades of a clump keep one length level.
+    height *= GrassPatchFactor(clumpCentre, type);
+    height *= lerp(0.5, 1.0, fullness) * fade;
+    if (height < 0.02) return;
+
+    // The sphere holds the tilted and wind-bent blade.
+    float3 centre = root + float3(0.0, height * 0.5, 0.0);
+    float radius = height * 0.8 + 0.05;
+    for (int plane = 0; plane < 6; plane++)
+    {
+        if (dot(_GrassPlanes[plane].xyz, centre) + _GrassPlanes[plane].w < -radius) return;
+    }
+
+    float angle = GrassRandom(seed) * 6.2831853;
+    float2 facing = lerp(float2(cos(angle), sin(angle)), float2(cos(clumpAngle), sin(clumpAngle)), type.clump.z);
+    facing /= max(length(facing), 0.0001);
+    float width = type.shape.z * lerp(0.75, 1.25, GrassRandom(seed)) *
+        pow(max(1.0, cameraDistance / fullDistance), _GrassDetail.y);
+    float tilt = lerp(type.bend.x, type.bend.y, GrassRandom(seed));
+    float bend = type.bend.z * lerp(0.6, 1.4, GrassRandom(seed));
+
+    float3 ground;
+    if (movedOnGround)
+    {
+        ground = GrassGroundNormal(position, root.y);
+    }
+    else
+    {
+        float texelStep = 1.0 / (_GrassTerrainOrigin.w - 1.0);
+        float slopeX = (GrassHeight(uv + float2(texelStep, 0.0)) - GrassHeight(uv - float2(texelStep, 0.0))) /
+            (2.0 * texelStep * _GrassTerrainSize.x);
+        float slopeZ = (GrassHeight(uv + float2(0.0, texelStep)) - GrassHeight(uv - float2(0.0, texelStep))) /
+            (2.0 * texelStep * _GrassTerrainSize.z);
+        ground = normalize(float3(-slopeX, 1.0, -slopeZ));
+    }
+
+    uint lod = cameraDistance < _GrassDetail.x ? 0u : 1u;
+    uint slot;
+    InterlockedAdd(_GrassCounters[lod], 1u, slot);
+    if (slot >= (uint)(lod == 0u ? _GrassNearCapacity : _GrassFarCapacity)) return;
+
+    GrassBlade blade;
+    blade.root = float4(root, height);
+    blade.shape = float4(facing, width, tilt);
+    blade.data = float4(bend, GrassRandom(seed),
+        asfloat((uint)typeIndex | (movedOnGround ? GRASS_ON_MESH_GROUND : 0u)), clumpValue * 2.0 - 1.0);
+    // The whole clump takes the world color at its centre, as the mesh grass took it at its root.
+    blade.ground = float4(ground.x, ground.z, asfloat(GrassWorldColor(clumpCentre + (onGround ? groundOffset : 0.0))),
+        fullness);
+    _GrassBlades[(lod == 0u ? 0u : (uint)_GrassNearCapacity) + slot] = blade;
+}
+
+[numthreads(1, 1, 1)]
+void WriteArguments()
+{
+    uint nearCount = min(_GrassCounters[0], (uint)_GrassNearCapacity);
+    uint farCount = min(_GrassCounters[1], (uint)_GrassFarCapacity);
+    _GrassCounters[2] = nearCount;
+    _GrassCounters[3] = farCount;
+    _GrassArguments[0] = (uint)_GrassNearIndexCount;
+    _GrassArguments[1] = (nearCount + 15u) / 16u;
+    _GrassArguments[2] = 0;
+    _GrassArguments[3] = 0;
+    _GrassArguments[4] = 0;
+    _GrassArguments[5] = (uint)_GrassFarIndexCount;
+    _GrassArguments[6] = (farCount + 15u) / 16u;
+    _GrassArguments[7] = (uint)_GrassNearIndexCount;
+    _GrassArguments[8] = 0;
+    _GrassArguments[9] = 0;
+}

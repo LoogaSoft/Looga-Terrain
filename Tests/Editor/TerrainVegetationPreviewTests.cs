@@ -88,6 +88,26 @@ namespace LoogaSoft.Terrain.Tests
         }
 
         [Test]
+        public void ObserverChangeKeepsRunningPreview()
+        {
+            _provider.BeginEditorPreview(new[] { _camera.transform });
+            Assert.IsTrue(_provider.ProcessChanges(), _provider.Diagnostic);
+            Assert.IsTrue(_provider.IsRendering);
+            var second = new GameObject("Second observer", typeof(Camera));
+            SceneManager.MoveGameObjectToScene(second, _scene);
+            second.GetComponent<Camera>().enabled = false;
+            // Maximizing the Game view hides the Scene view, so the preview cameras change while the preview runs.
+            _provider.BeginEditorPreview(new[] { _camera.transform, second.transform });
+            Assert.IsTrue(_provider.IsRendering);
+            Assert.IsFalse(_terrain.drawTreesAndFoliage);
+            Assert.IsTrue(_provider.ProcessChanges(), _provider.Diagnostic);
+            _provider.BeginEditorPreview(new[] { second.transform });
+            Assert.IsTrue(_provider.IsRendering);
+            _provider.EndEditorPreview();
+            Assert.IsTrue(_terrain.drawTreesAndFoliage);
+        }
+
+        [Test]
         public void DisablingProviderClearsTemporaryObserverOwnership()
         {
             _provider.BeginEditorPreview(new[] { _camera.transform });
@@ -107,13 +127,16 @@ namespace LoogaSoft.Terrain.Tests
         }
 
         [Test]
-        public void PreviewDoesNotTakeAnotherRenderersNativeOwnership()
+        public void PreviewTakesHiddenNativeFoliageWithoutOwner()
         {
+            // Hidden native foliage without a Looga or vendor owner is left over from an interrupted handover. The
+            // provider takes it, and the end of the preview restores it as visible.
             _terrain.drawTreesAndFoliage = false;
             _provider.BeginEditorPreview(new[] { _camera.transform });
-            Assert.IsFalse(_provider.ProcessChanges());
-            _provider.EndEditorPreview();
+            Assert.IsTrue(_provider.ProcessChanges(), _provider.Diagnostic);
             Assert.IsFalse(_terrain.drawTreesAndFoliage);
+            _provider.EndEditorPreview();
+            Assert.IsTrue(_terrain.drawTreesAndFoliage);
         }
     }
 }

@@ -6,7 +6,7 @@
     "Unity.RenderPipelines.Core.Runtime",
     "Unity.Burst",
     "Unity.Mathematics",
-    "LoogaSoft.Instancing"
+    "LoogaSoft.Instancing.Runtime"
   ],
   "allowUnsafeCode": true,
   "autoReferenced": true

@@ -10,7 +10,7 @@ Shader "Hidden/Looga/Ground Extra Probe"
             #pragma vertex Vertex
             #pragma fragment Fragment
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
-            #include "Packages/com.loogasoft.loogainstancing/ShaderLibrary/VegetationGroundData.hlsl"
+            #include "Packages/com.loogasoft.loogagraphicspro/Instancing/ShaderLibrary/VegetationGroundData.hlsl"
             float4 _ProbeWorld;
             int _ProbeChannel;
             float4 Vertex(uint id : SV_VertexID) : SV_POSITION

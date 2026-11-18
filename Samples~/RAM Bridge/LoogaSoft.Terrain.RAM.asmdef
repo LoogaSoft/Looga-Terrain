@@ -3,7 +3,7 @@
   "references": [
     "LoogaSoft.Terrain.Instances",
     "RAM",
-    "LoogaSoft.Instancing"
+    "LoogaSoft.Instancing.Runtime"
   ],
   "autoReferenced": true
 }

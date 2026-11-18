@@ -1,0 +1,121 @@
+// Looga Stamps contact stamp. Heights are in heightmap texture units. The apron holds the heights before the stamp over
+// the target plus the stamp reach on each side (see LoogaHeightSmooth.compute for the apron and the target layout).
+// The footprint holds the winding number of the ground point at each apron texel (LoogaContactFootprint.shader).
+// 1. Seed: the rock stands on the ground where the winding number is 1 or more.
+// 2. JumpFlood: each texel finds the nearest contact texel.
+// 3. ApplyContact: the ground rises by the ramp height at the rock, down to zero at the reach. Under the rock it rises
+//    by the full height, so the ramp has no step at the rock edge.
+#pragma kernel Seed
+#pragma kernel JumpFlood
+#pragma kernel ApplyContact
+
+#define NO_SEED -1e6
+#define MAXIMUM_HEIGHT (32766.0 / 65535.0)
+
+int2 _ApronSize;
+int2 _TargetSize;
+int _Reach;
+int _Step;
+float2 _ApronOrigin;
+float _TexelSize;
+float _TerrainHeight;
+float _RealHeight;
+
+// Distances and heights in metres.
+float _RampReach;
+float _RampSlope;
+float _ProfilePower;
+float _ReachVariation;
+float _VariationSize;
+float _Strength;
+
+Texture2D<float> _ApronIn;
+Texture2D<float> _FootprintIn;
+RWTexture2D<float2> _SeedOut;
+Texture2D<float2> _SeedIn;
+RWTexture2D<float> _Target;
+
+float ContactHash(float2 p)
+{
+    float3 p3 = frac(float3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return frac((p3.x + p3.y) * p3.z);
+}
+
+float ContactValueNoise(float2 p)
+{
+    float2 i = floor(p);
+    float2 f = frac(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return lerp(lerp(ContactHash(i), ContactHash(i + float2(1, 0)), f.x),
+                lerp(ContactHash(i + float2(0, 1)), ContactHash(i + float2(1, 1)), f.x), f.y);
+}
+
+bool IsContact(int2 p)
+{
+    return _FootprintIn[p] > 0.5;
+}
+
+[numthreads(8, 8, 1)]
+void Seed(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _ApronSize)) return;
+    int2 p = (int2)id.xy;
+    _SeedOut[p] = IsContact(p) ? float2(p) : float2(NO_SEED, NO_SEED);
+}
+
+[numthreads(8, 8, 1)]
+void JumpFlood(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _ApronSize)) return;
+    int2 p = (int2)id.xy;
+    float2 best = _SeedIn[p];
+    float bestDistance = best.x > NO_SEED * 0.5 ? dot(best - p, best - p) : 1e30;
+    for (int y = -1; y <= 1; y++)
+    {
+        for (int x = -1; x <= 1; x++)
+        {
+            int2 q = p + int2(x, y) * _Step;
+            if (any(q < 0) || any(q >= _ApronSize)) continue;
+            float2 seed = _SeedIn[q];
+            if (seed.x < NO_SEED * 0.5) continue;
+            float distance = dot(seed - p, seed - p);
+            if (distance < bestDistance)
+            {
+                best = seed;
+                bestDistance = distance;
+            }
+        }
+    }
+    _SeedOut[p] = best;
+}
+
+[numthreads(8, 8, 1)]
+void ApplyContact(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _TargetSize)) return;
+    int2 p = (int2)id.xy + _Reach;
+    float height = _ApronIn[p];
+    // The reach changes slowly along the rock. The angle stays the same, so a longer ramp is also higher.
+    float2 world = _ApronOrigin + float2(p) * _TexelSize;
+    float noise = ContactValueNoise(world / _VariationSize) * 0.65 +
+                  ContactValueNoise(world / (_VariationSize * 0.37) + 17.3) * 0.35;
+    float reach = _RampReach * max(0.05, 1.0 + _ReachVariation * (2.0 * noise - 1.0));
+    float rampHeight = reach * _RampSlope / _ProfilePower;
+    float rise = 0;
+    if (IsContact(p))
+    {
+        rise = rampHeight;
+    }
+    else
+    {
+        float2 seed = _SeedIn[p];
+        if (seed.x > NO_SEED * 0.5)
+        {
+            // The contact texel reaches half a texel toward this one, where the rock edge is.
+            float distance = max(0.0, length(float2(p) - seed) - 0.5) * _TexelSize;
+            rise = rampHeight * pow(1.0 - saturate(distance / reach), _ProfilePower);
+        }
+    }
+    _Target[id.xy] = rise > 0 ? clamp(height + rise * _Strength / _RealHeight, 0, MAXIMUM_HEIGHT) : height;
+}

@@ -1,7 +1,10 @@
 #pragma kernel EncodeBC3
-Texture2D<float4> _Source;
-RWTexture2D<uint4> _Blocks;
-int _NormalChannel;
+// One staging slice per page of the batch. The blocks of channel c and page p are in slice c * batch + p.
+Texture2DArray<float4> _Source;
+RWTexture2DArray<uint4> _Blocks;
+// 0 = colour (SRGB bytes), 1 = signed normal, 2 = linear 0 to 1 data.
+int _ChannelKind;
+uint _BlockSliceOffset;
 
 uint Pack565(float3 color)
 {
@@ -23,14 +26,14 @@ void EncodeBC3(uint3 dispatch : SV_DispatchThreadID)
     float alphaLow = 1, alphaHigh = 0;
     for (uint i = 0; i < 16; i++)
     {
-        float4 value = _Source.Load(int3(dispatch.xy * 4 + uint2(i & 3, i >> 2), 0));
-        if (_NormalChannel != 0)
+        float4 value = _Source.Load(int4(dispatch.xy * 4 + uint2(i & 3, i >> 2), dispatch.z, 0));
+        if (_ChannelKind == 1)
         {
             // MicroSplat can produce unnormalized normals. Preserve direction before mapping to UNorm.
             value.rgb *= rsqrt(max(dot(value.rgb, value.rgb), 1e-12));
             value.rgb = value.rgb * 0.5 + 0.5;
         }
-        else
+        else if (_ChannelKind == 0)
         {
             // The source SRGB view returns linear color. BC3 stores SRGB-encoded bytes.
             value.rgb = lerp(12.92 * value.rgb, 1.055 * pow(max(value.rgb, 0), 1.0 / 2.4) - 0.055, step(0.0031308, value.rgb));
@@ -100,5 +103,5 @@ void EncodeBC3(uint3 dispatch : SV_DispatchThreadID)
             alpha.y |= best << (bit - 32);
         }
     }
-    _Blocks[dispatch.xy] = uint4(alpha, first | (second << 16), indices);
+    _Blocks[uint3(dispatch.xy, _BlockSliceOffset + dispatch.z)] = uint4(alpha, first | (second << 16), indices);
 }

@@ -1,0 +1,136 @@
+// Adds the procedural grass to the ground cover maps of LoogaTerrainSurfaceGlobals (GrassGroundCover). The base maps
+// hold the other plants. Each texel takes the detail cells whose centres lie in it, as the CPU ground tools sum them.
+#pragma kernel CopyBase
+#pragma kernel AddGrass
+
+#define COVER_MAXIMUM_TYPES 8
+// The base closure is stored in 8 bits. 1 would give an infinite density.
+#define COVER_MAXIMUM_BASE_CLOSURE (254.5 / 255.0)
+
+Texture2D<float2> _CoverBaseCoverage;
+Texture2D<float4> _CoverBaseCanopy;
+RWTexture2D<float2> _CoverCoverage;
+RWTexture2D<float4> _CoverCanopy;
+
+// The grass terrain that owns the texels (slot 0) and its +X, +Z and +XZ neighbours: a texel is smaller than a terrain,
+// so it crosses at most one terrain border on each axis.
+Texture2DArray<float> _CoverTerrain0;
+Texture2DArray<float> _CoverTerrain1;
+Texture2DArray<float> _CoverTerrain2;
+Texture2DArray<float> _CoverTerrain3;
+float4 _CoverTerrainCells[4];   // Per slot: world X and Z of the origin, detail cell size along X and Z
+float4 _CoverTerrainInfo[4];    // Per slot: detail resolution, 1 when the slot has a terrain
+
+// Per type: x lattice share at full coverage, y full coverage, z blade footprint at full coverage (m2), w share of the
+// own colour. Then RGB own colour over the canopy colour scale.
+StructuredBuffer<float4> _CoverGrassTypes;
+
+float4 _CoverGrid;      // World X and Z of the map origin, texel size along X and Z
+int4 _CoverSize;        // Map width and depth, type count
+int4 _CoverRect;        // Texels of the dispatch: first X and Z, width and depth
+float _CoverClosure;    // Closure per blade footprint: closure scale x lattice points per m2
+
+[numthreads(8, 8, 1)]
+void CopyBase(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _CoverSize.xy)) return;
+    _CoverCoverage[id.xy] = _CoverBaseCoverage.Load(int3(id.xy, 0));
+    _CoverCanopy[id.xy] = _CoverBaseCanopy.Load(int3(id.xy, 0));
+}
+
+float CoverDetail(int slot, int3 cell)
+{
+    float value = 0.0;
+    [branch] if (slot == 0) value = _CoverTerrain0.Load(int4(cell, 0));
+    else if (slot == 1) value = _CoverTerrain1.Load(int4(cell, 0));
+    else if (slot == 2) value = _CoverTerrain2.Load(int4(cell, 0));
+    else value = _CoverTerrain3.Load(int4(cell, 0));
+    return round(value * 255.0);
+}
+
+// The texel of a detail cell along one axis, as the CPU ground tools compute it.
+int CoverTexelOf(float origin, int cell, float cellSize, float mapOrigin, float texelSize)
+{
+    return (int)floor((origin + (cell + 0.5) * cellSize - mapOrigin) / texelSize);
+}
+
+// The cells of a terrain along one axis whose centres can lie in a texel, with one cell to spare on each side.
+int2 CoverCellRange(float origin, float cellSize, int resolution, float texelMin, float texelSize)
+{
+    int first = (int)floor((texelMin - origin) / cellSize - 0.5) - 1;
+    int last = (int)ceil((texelMin + texelSize - origin) / cellSize - 0.5) + 1;
+    return int2(max(first, 0), min(last, resolution - 1));
+}
+
+[numthreads(8, 8, 1)]
+void AddGrass(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _CoverRect.zw)) return;
+    int2 texel = _CoverRect.xy + (int2)id.xy;
+    if (any(texel < 0) || any(texel >= _CoverSize.xy)) return;
+    float2 texelMin = _CoverGrid.xy + texel * _CoverGrid.zw;
+    int typeCount = min(_CoverSize.z, COVER_MAXIMUM_TYPES);
+
+    float density = 0.0;
+    float own = 0.0;
+    float3 color = 0.0;
+    float samples = 0.0;
+    for (int slot = 0; slot < 4; slot++)
+    {
+        if (_CoverTerrainInfo[slot].y < 0.5) continue;
+        float4 cells = _CoverTerrainCells[slot];
+        int resolution = (int)_CoverTerrainInfo[slot].x;
+        int2 rangeX = CoverCellRange(cells.x, cells.z, resolution, texelMin.x, _CoverGrid.z);
+        int2 rangeZ = CoverCellRange(cells.y, cells.w, resolution, texelMin.y, _CoverGrid.w);
+        for (int z = rangeZ.x; z <= rangeZ.y; z++)
+        {
+            if (CoverTexelOf(cells.y, z, cells.w, _CoverGrid.y, _CoverGrid.w) != texel.y) continue;
+            for (int x = rangeX.x; x <= rangeX.y; x++)
+            {
+                if (CoverTexelOf(cells.x, x, cells.z, _CoverGrid.x, _CoverGrid.z) != texel.x) continue;
+                samples += 1.0;
+                // The renderer grows at most one blade at a lattice point, so the blade shares of all types scale
+                // down together when they add up to more than 1.
+                float values[COVER_MAXIMUM_TYPES];
+                float lattice = 0.0;
+                for (int layer = 0; layer < typeCount; layer++)
+                {
+                    float4 layerShape = _CoverGrassTypes[layer * 2];
+                    values[layer] = CoverDetail(slot, int3(x, z, layer));
+                    lattice += saturate(values[layer] / 255.0 / layerShape.y) * layerShape.x;
+                }
+                float limit = lattice > 1.0 ? 1.0 / lattice : 1.0;
+                for (int type = 0; type < typeCount; type++)
+                {
+                    float4 shape = _CoverGrassTypes[type * 2];
+                    float fullness = saturate(values[type] / 255.0 / shape.y);
+                    float share = fullness * shape.x;
+                    // The blades are shorter at low coverage (ProceduralGrassType.BladeFootprint).
+                    float value = _CoverClosure * share * shape.z * lerp(0.5, 1.0, fullness) * limit;
+                    if (value <= 0.0) continue;
+                    density += value;
+                    float ownValue = value * shape.w;
+                    own += ownValue;
+                    color += _CoverGrassTypes[type * 2 + 1].rgb * ownValue;
+                }
+            }
+        }
+    }
+
+    float2 baseCoverage = _CoverBaseCoverage.Load(int3(texel, 0));
+    float4 baseCanopy = _CoverBaseCanopy.Load(int3(texel, 0));
+    if (samples <= 0.0 || density <= 0.0)
+    {
+        _CoverCoverage[texel] = baseCoverage;
+        _CoverCanopy[texel] = baseCanopy;
+        return;
+    }
+    // Mean densities per detail cell. The base map stores the closure 1 - exp(-density) of the other plants, and its
+    // canopy the own colour sum and own share, each over that density.
+    float grass = density / samples;
+    float baseDensity = -log(1.0 - min(baseCoverage.r, COVER_MAXIMUM_BASE_CLOSURE));
+    float total = baseDensity + grass;
+    _CoverCoverage[texel] = float2(1.0 - exp(-total), baseCoverage.g);
+    _CoverCanopy[texel] = float4((baseCanopy.rgb * baseDensity + color / samples) / total,
+        (baseCanopy.a * baseDensity + own / samples) / total);
+}

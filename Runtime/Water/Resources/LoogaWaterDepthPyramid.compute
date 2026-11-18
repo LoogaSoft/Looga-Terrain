@@ -1,0 +1,35 @@
+// Builds one level of the closest-depth pyramid for the water screen-space reflections. Each destination texel keeps
+// the depth of the closest surface in its 2 x 2 source texels. At an odd source size, the last destination texel also
+// covers the last source row or column, so every source texel has a place in the pyramid.
+#pragma kernel Reduce
+#pragma target 4.5
+
+Texture2D<float> _Source;
+RWTexture2D<float> _Destination;
+// xy: source size. zw: destination size. In texels.
+int4 _ReductionSize;
+int _SourceMip;
+// 1 = reversed depth (1 at the near plane), so the closest surface has the largest value.
+int _Reversed;
+
+[numthreads(8, 8, 1)]
+void Reduce(uint3 id : SV_DispatchThreadID)
+{
+    int2 texel = (int2)id.xy;
+    int2 destinationSize = _ReductionSize.zw;
+    if (any(texel >= destinationSize)) return;
+
+    int2 sourceSize = _ReductionSize.xy;
+    int2 first = texel * 2;
+    int2 last = min(texel == destinationSize - 1 ? sourceSize : first + 2, sourceSize);
+    float closest = _Reversed != 0 ? 0 : 1;
+    for (int y = first.y; y < last.y; y++)
+    {
+        for (int x = first.x; x < last.x; x++)
+        {
+            float depth = _Source.Load(int3(x, y, _SourceMip));
+            closest = _Reversed != 0 ? max(closest, depth) : min(closest, depth);
+        }
+    }
+    _Destination[texel] = closest;
+}

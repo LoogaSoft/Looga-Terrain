@@ -1,3 +1,4 @@
+using LoogaSoft.Instancing;
 using UnityEngine;
 using UnityEngine.Rendering;
 
@@ -6,22 +7,14 @@ namespace LoogaSoft.Terrain
     public sealed partial class TerrainRenderer
     {
         // Material holes can differ from TerrainData holes. Unknown depth contracts retain their normal material passes.
-        internal bool SupportsNativeDepth => _surfaceMaterial
-            && _surfaceMaterial.GetTag("LoogaTerrainDepth", false, "") == "NativeHeightsAndHoles";
+        internal bool SupportsNativeDepth => ActiveSurfaceMaterial
+            && InstanceShaderInspection.GetTag(ActiveSurfaceMaterial, "LoogaTerrainDepth") == "NativeHeightsAndHoles";
 
         internal void DrawOccluders(Camera camera, CommandBuffer commands, Material material)
         {
             if (!SupportsNativeDepth || !_cameras.TryGetValue(camera, out CameraBuffers buffers) || ClassifyBounds(_bounds) < 0) return;
             commands.DrawMeshInstancedIndirect(_mesh, 0, material, 0, buffers.VisibleArguments,
                 buffers.ArgumentIndex * GraphicsBuffer.IndirectDrawIndexedArgs.size, buffers.VisibleProperties);
-        }
-
-        internal static void CullShadows(Camera camera, CommandBuffer commands, Vector4[] planes, Vector4[] lights, int lightCount)
-        {
-            if (_cameraCommands.TryGetValue(camera, out SelectionCommands selection))
-            {
-                selection.CullShadows(commands, planes, lights, lightCount);
-            }
         }
 
         internal static void CullOccluded(Camera camera, CommandBuffer commands, Texture depth, Matrix4x4 projection,

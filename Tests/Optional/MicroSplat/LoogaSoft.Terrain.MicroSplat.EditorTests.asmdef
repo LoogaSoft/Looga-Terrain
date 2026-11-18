@@ -5,7 +5,8 @@
     "LoogaSoft.Terrain.MicroSplat.Editor",
     "LoogaSoft.Terrain.Runtime",
     "LoogaSoft.Terrain.MicroSplat",
-    "JBooth.MicroSplat.Core"
+    "JBooth.MicroSplat.Core",
+    "LoogaSoft.Terrain.Stamps"
   ],
   "includePlatforms": [
     "Editor"

@@ -88,5 +88,67 @@ namespace LoogaSoft.Terrain.Tests
             Assert.AreEqual(1, _provider.SourceStatus.NativeFallbackSources);
             StringAssert.Contains("Native vegetation remains enabled", _provider.Diagnostic);
         }
+
+        [Test]
+        public void HeightWriteWithoutTreesKeepsLoogaAndLoadsTheChangedPatchesAfterTheSynchronization()
+        {
+            _data.treeInstances = new TreeInstance[0];
+            // 8 x 8 detail patches, so a patch update and a full rebuild read a different number of patches.
+            _data.heightmapResolution = 257;
+            _data.size = new Vector3(64, 16, 64);
+            _data.SetDetailResolution(64, 8);
+            var detail = new int[64, 64];
+            detail[40, 40] = 8;
+            _data.SetDetailLayer(0, 0, 0, detail);
+            _terrain.drawTreesAndFoliage = true;
+            Assert.IsTrue(_provider.ProcessChanges(), _provider.Diagnostic);
+            Assert.AreEqual(64, _provider.LastPatchReads, "A full rebuild reads all patches");
+            int count = _provider.InstanceCount;
+            WriteHeights(new RectInt(0, 0, 8, 8));
+            Assert.IsTrue(_provider.ProcessChanges(), _provider.Diagnostic);
+            Assert.IsFalse(_terrain.drawTreesAndFoliage, "No native fallback while the heights synchronize");
+            Assert.AreEqual(1, _provider.SourceStatus.LoogaOwnedSources);
+            Assert.IsTrue(_provider.SourceStatus.IsWaiting);
+            Assert.AreEqual(0, _provider.LastPatchReads, "Patches wait for the CPU heights");
+            Assert.AreEqual(count, _provider.InstanceCount);
+            _data.SyncHeightmap();
+            Assert.IsTrue(_provider.ProcessChanges(), _provider.Diagnostic);
+            Assert.IsFalse(_terrain.drawTreesAndFoliage);
+            Assert.IsFalse(_provider.SourceStatus.IsWaiting);
+            Assert.That(_provider.LastPatchReads, Is.InRange(1, 8), "Only the patches near the change load again");
+            Assert.AreEqual(count, _provider.InstanceCount);
+        }
+
+        [Test]
+        public void HeightWriteWithTreesWaitsOnNativeVegetation()
+        {
+            Assert.IsTrue(_provider.ProcessChanges(), _provider.Diagnostic);
+            WriteHeights(new RectInt(0, 0, 8, 8));
+            Assert.IsFalse(_provider.ProcessChanges());
+            Assert.IsTrue(_terrain.drawTreesAndFoliage, "Trees are read again in full after the synchronization");
+            _data.SyncHeightmap();
+            Assert.IsTrue(_provider.ProcessChanges(), _provider.Diagnostic);
+            Assert.IsFalse(_terrain.drawTreesAndFoliage);
+        }
+
+        // Writes a constant height into a heightmap area without a CPU synchronization, as GPU terrain tools do.
+        private void WriteHeights(RectInt area)
+        {
+            RenderTexture previous = RenderTexture.active;
+            RenderTexture target = RenderTexture.GetTemporary(area.width, area.height, 0,
+                UnityEngine.Terrain.heightmapRenderTextureFormat);
+            try
+            {
+                RenderTexture.active = target;
+                GL.Clear(false, true, new Color(0.25f, 0f, 0f, 0f));
+                _data.CopyActiveRenderTextureToHeightmap(new RectInt(0, 0, area.width, area.height), area.position,
+                    TerrainHeightmapSyncControl.None);
+            }
+            finally
+            {
+                RenderTexture.active = previous;
+                RenderTexture.ReleaseTemporary(target);
+            }
+        }
     }
 }

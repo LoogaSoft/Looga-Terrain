@@ -29,7 +29,7 @@ void Generate(uint3 id : SV_DispatchThreadID)
     uint2 candidate = _Candidates[id.x];
     uint seed = DetailHash(candidate.x ^ _Seed) ^ DetailHash(candidate.y + 1);
     float2 cell = float2(candidate.x % (uint)_Layout.z, candidate.x / (uint)_Layout.z);
-    float2 uv = (cell + float2(DetailRandom(seed), DetailRandom(seed + 1))) / _Layout.z;
+    float2 uv = DetailPosition(cell, seed, _Layout.z);
     float2 delta = 1.0 / (_Layout.x - 1);
     float3 normal = normalize(float3((Height(uv - float2(delta.x, 0)) - Height(uv + float2(delta.x, 0))) / (2 * delta.x * _Size.x),
         1, (Height(uv - float2(0, delta.y)) - Height(uv + float2(0, delta.y))) / (2 * delta.y * _Size.z)));

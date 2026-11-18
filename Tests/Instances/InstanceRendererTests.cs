@@ -1,4 +1,7 @@
 using LoogaSoft.Instancing;
+#if LOOGA_GRAPHICS_PRO
+using LoogaSoft.Lighting;
+#endif
 using System;
 using System.Collections;
 using UnityEngine.TestTools;
@@ -182,6 +185,17 @@ namespace LoogaSoft.Terrain.Instances.Tests
         private IEnumerator RunImage(bool orthographic, bool crossFade, bool tint, bool vegetation, bool billboard, int features, int mode,
             string shaderName = null, bool graphicsPro = false)
         {
+            // Looga Graphics Pro supplies Vegetation Lit, the wind field and the interactor.
+            if (vegetation && !Shader.Find("Looga/Terrain/Vegetation Lit"))
+            {
+                Assert.Ignore("Looga/Terrain/Vegetation Lit needs Looga Graphics Pro.");
+            }
+#if !LOOGA_GRAPHICS_PRO
+            if ((features & (4 | 64)) != 0)
+            {
+                Assert.Ignore("Wind field and interaction checks need Looga Graphics Pro.");
+            }
+#endif
             Scene previousScene = SceneManager.GetActiveScene();
             bool ownsLightmapScene = false;
             Scene scene;
@@ -259,6 +273,7 @@ namespace LoogaSoft.Terrain.Instances.Tests
                     sun.cullingMask = 1 << 30;
                     sun.transform.rotation = Quaternion.Euler(35, -20, 0);
                 }
+#if LOOGA_GRAPHICS_PRO
                 if ((features & 4) != 0)
                 {
                     var fieldObject = new GameObject("Shared wind");
@@ -274,6 +289,7 @@ namespace LoogaSoft.Terrain.Instances.Tests
                     interactor.AddComponent<VegetationInteractor>().Configure(8, 1);
                     material.SetVector("_InteractionParams", new Vector4(1.5f, 0, 0, 0));
                 }
+#endif
                 if ((features & 128) != 0)
                 {
                     groundData = new TerrainData { heightmapResolution = 33, size = new Vector3(32, 4, 32) };

@@ -1,6 +1,6 @@
 # Instance and vegetation rendering
 
-General mesh rendering and authoring are provided by the shared Looga Instancing package.
+General mesh rendering and authoring are provided by the Instancing subsystem of Looga Graphics Pro.
 TerrainData providers, ground bindings and terrain-tool adapters remain in Looga Terrain.
 Both products retain their existing virtual texture caches.
 It uses public BatchRendererGroup and DOTS instancing APIs. It does not require a vendor vegetation renderer.
@@ -31,7 +31,7 @@ Placements use the container's local space. Container and parent transforms upda
 The container draws while enabled, including Editor previews. It does not hide existing scene renderers.
 Do not place the same population under two render owners.
 
-For general runtime ownership, use `LoogaSoft.Instancing`. Terrain providers retain `LoogaSoft.Terrain.Instances`:
+For general runtime ownership, use the `LoogaSoft.Instancing` namespace (assembly `LoogaSoft.Instancing.Runtime`). Terrain providers retain `LoogaSoft.Terrain.Instances`:
 
 ```csharp
 var prototype = InstancePrototype.FromPrefab(prefab);
@@ -120,18 +120,10 @@ Detail paint has no general native TerrainCallbacks event. Custom tools must use
 A local detail edit regenerates only its intersecting native patches, across all detail layers.
 The default fully resident path extracts all placements synchronously. The optional streaming path extracts detail placements by cell.
 Instance Limit bounds admitted resident instances, with a default of 250,000. It does not include shared meshes or textures.
+In streaming, required cells that do not fit Instance Limit or the resident cell limit stay missing. Loaded cells keep
+drawing, and the missing cells load when evictions free space. The diagnostic reports this state.
+Streaming requires detail cells by 3D observer distance, so observers high above the terrain load fewer details.
 A dirty patch can grow buffers. Buffer allocation and native placement extraction cannot be interrupted by the staged CPU budget.
-
-## MicroVerse vegetation coordination
-
-The optional MicroVerseVegetationBridge uses public begin, finish and cancel events.
-Assign the MicroVerse source and explicit TerrainVegetationProvider targets.
-The bridge suspends Looga ownership during generation. It resumes when MicroVerse stops modifying and spawning.
-It does not wait for IsHeightSyncd. MicroVerse 1.7.0 leaves that flag false after the first update of a session.
-Each provider waits for CPU heights itself: Unity reports unsynchronized heightmap changes to the provider.
-It requests a full source refresh after resumption. It does not request generation or mutate private synchronization state.
-Disable the bridge to remove its block. The core Instances assembly has no MicroVerse dependency.
-Public road, spline and RAM adapters connect source changes to placement masks. See Road, water and MicroVerse masks below.
 
 ## Provider limits
 
@@ -148,6 +140,7 @@ Do not infer those features from the BRG core or claim the complete vegetation r
 ## Looga vegetation wind and LOD transitions
 
 Use Looga/Terrain/Vegetation Lit on explicitly assigned vegetation materials. The renderer does not convert vendor materials.
+Looga Graphics Pro supplies this shader. Texture detail prototypes also need it.
 The shader supports albedo/color, alpha cutout, optional normal maps, smoothness and bounded local-space wind.
 URP surface, depth, depth-normal and shadow passes use the same deformed position and corrected normal/tangent.
 The Forward and GBuffer passes use URP shader includes. Player image qualification uses Deferred+.
@@ -273,7 +266,7 @@ DisableStreaming returns to full residency. Disable the provider to release all 
 
 ResidentCells, LastCellLoads, LastCellEvictions, InstanceCount and GpuBytes report residency.
 Local detail invalidation evicts and reloads only affected resident patches. Tree changes rebuild the tree index.
-MicroVerse authoring blocks and terrain height synchronization suspend ownership through the existing provider contract.
+Terrain height synchronization suspends ownership through the existing provider contract.
 
 ## Instance appearance and transform history
 
@@ -319,7 +312,7 @@ The core rejects a baked prototype whose lightmap is unavailable. Source assets 
 
 ## Shared Looga wind
 
-Add one `VegetationWindField` for world-space direction and gust controls. Strength and gust amplitude are bounded to zero through one.
+Add one `VegetationWindField` (Looga Graphics Pro) for world-space direction and gust controls. Strength and gust amplitude are bounded to zero through one.
 Up to eight local spherical volumes blend direction using a smooth edge. The volume transform supplies position and forward direction.
 Gusts travel downwind as fronts. Gust Wavelength sets the distance between fronts; they move at Gust Frequency x Gust Wavelength / 2 pi
 meters per second. A moving noise curves the fronts and changes their strength. Lean is the part of the trunk amplitude that bends
@@ -423,7 +416,7 @@ The static material family shares one UnityPerMaterial layout across all passes.
 Auxiliary passes use that layout too. Static motion uses Unity's object-motion functions. Deformed foliage needs its own historical deformation path.
 The RVT surface receiver and SVT receiver/feedback shaders also declare DOTS variants.
 The SVT instance profile uses the existing cache registry and collects feedback from BRG draws. Ground RVT receivers retain direct or coarse fallback.
-Both products depend on Looga Instancing, but neither depends on the other product. Ordinary compatible materials do not need a Looga profile or shader replacement.
+Looga Terrain depends on Looga Graphics Pro, which contains Instancing. Ordinary compatible materials do not need a Looga profile or shader replacement.
 Transparent sources retain native rendering. Graphics Pro vegetation uses an explicit bounded wind profile. The supported material and auxiliary-pass matrix is described under Qualification below.
 
 ## Container placement editing
@@ -555,7 +548,7 @@ Native internal references are remapped to the new hierarchy. Original assets re
 The export reports dependencies under the installed FR2, BRGIR and Flora roots. Replace those meshes or materials before export.
 It does not translate proprietary vendor shaders or delete vendor packages.
 
-## Road, water and MicroVerse masks
+## Road and water masks
 
 `PlacementExclusion` accepts a local polyline corridor or a readable generated MeshFilter.
 Corridors use world-space radius, falloff and height bands. Height bands preserve vegetation below elevated bridges.
@@ -565,32 +558,8 @@ Mask events queue the union of old and new bounds. Editor Auto Refresh applies t
 Call `ProcessExclusionChanges` after runtime source updates. Callback handlers do not regenerate placements inside a vendor event.
 Use `Clear` after unloading a generated source. Arbitrary vertex-buffer edits still require `Refresh`.
 
-`MicroVersePlacementBridge` belongs to the optional MicroVerse assembly.
-Assign a dedicated scene-object provider, explicit object-output roots and any generated road/spline masks.
-The bridge reconfigures its provider after each update, so turn off the provider's Track Source Changes for large outputs.
-Begin events release native renderer suppression. Finished and cancelled updates recapture only after public height synchronization completes.
-After a scene load with no MicroVerse update, the bridge captures when MicroVerse is idle. It does not wait for IsHeightSyncd.
-MicroVerse 1.7.0 does not set IsHeightSyncd after the first update of a session.
-After a scene load, Scene Objects mode therefore waits until a second MicroVerse update.
-
-Data mode (`ConfigureData`) is an alternative for object stamps. It requires the MicroVerse objects module.
-The bridge copies the spawned root transforms into one `InstanceSet`, with one entry for each stamp and prefab.
-One set uses one renderer, so each view runs one culling callback for all Data mode prototypes.
-The bridge creates the set as a child when none is assigned.
-It matches a spawned root to a prefab by the meshes, materials and root-relative transforms of its renderers.
-Prefab variants that share meshes and differ only in materials therefore stay separate. Roots that match no prefab stay native.
-Data mode waits only until MicroVerse stops modifying and spawning. It does not wait for IsHeightSyncd.
-The bridge writes one set entry in each call to `ProcessChanges`, so GPU uploads spread over several updates.
-With Strip Native Parts on, the bridge removes the LOD groups and the render-only child objects of each spawned root.
-The root keeps its colliders. With Strip Native Parts off, the bridge only hides the renderers.
-The set keeps its placements while the output holds hidden or stripped roots.
-A stamp needs a Parent Object. Data mode rejects Spawn As Prefab, because the MicroVerse pool can reuse a stripped instance.
-`Configure` selects Scene Objects mode and disables the data set. Stripped roots stay invisible until MicroVerse respawns them.
-The bridge never starts a MicroVerse bake or changes private synchronization state.
-The optional editor bridge queues refresh after Undo, hierarchy changes and asset imports. It ignores these events during Play mode.
-`RequestRefresh` supports explicit application hooks. Road and water masks regenerate only intersecting scatter triangles.
+Road and water masks regenerate only intersecting scatter triangles.
 Mesh vertex edits must call `InvalidateSurface` with the affected bounds. Topology changes require `RequestRebuild` and `Regenerate`.
-The bridge does not infer modified triangles from a vendor completion event. Tests exercise actual installed MicroVerse road generation, generated-object replacement and source deletion.
 
 Import the RAM Placement Bridge sample only when RAM is installed.
 Assign exactly one RamSpline or LakePolygon and a dedicated PlacementExclusion.
@@ -612,7 +581,7 @@ Stable tiles use one owned height copy. A changed tile can retain two copies unt
 Disable Track Height History only for terrain whose heights remain static.
 
 Extra Map and Extra Data supply application-defined inputs for each terrain surface.
-Custom shaders can include `Packages/com.loogasoft.loogainstancing/ShaderLibrary/VegetationGroundData.hlsl` and call `VegetationGroundExtra` with world XZ.
+Custom shaders can include `Packages/com.loogasoft.loogagraphicspro/Instancing/ShaderLibrary/VegetationGroundData.hlsl` and call `VegetationGroundExtra` with world XZ.
 The function returns the sampled RGBA map and per-surface values separately. Shared edges average both inputs.
 An unassigned map returns white. No biome or wind interpretation is imposed on these channels.
 
@@ -641,7 +610,7 @@ D3D12 player comparisons also cover cached normals, object motion, changing grou
 The focused Forward+ and Deferred+ cases match native rendering for surface color, normals and motion.
 These checks cover the installed material contracts. Arbitrary shader extensions require their own receiver policy.
 
-`VegetationInteractor` supplies up to sixteen interaction spheres to the Looga vegetation shader.
+`VegetationInteractor` (Looga Graphics Pro) supplies up to sixteen interaction spheres to the Looga vegetation shaders.
 Interaction displacement remains bounded by the material limit and contributes to conservative instance bounds.
 Graphics Pro foliage, grass and bark now include explicit DOTS and auxiliary passes with bounded deformation.
 Focused tests cover previous deformation and nonzero motion with both renderers.
@@ -651,7 +620,7 @@ URP can strip required variants when a pipeline is only referenced by a scene as
 
 ## Shared package migration
 
-General APIs and editor tools now use `LoogaSoft.Instancing` and `LoogaSoft.Instancing.Editor`.
+General APIs and editor tools use the `LoogaSoft.Instancing.Runtime` and `LoogaSoft.Instancing.Editor` assemblies of Looga Graphics Pro.
 Native SpeedTree profiles use `LoogaSoft.Instancing.SpeedTree`. Update source imports and assembly references.
 Moved scripts retain their asset GUIDs and declare their former serialized type identity with `MovedFrom`.
 Saved placement IDs and binary formats are unchanged. Existing legacy prefab and placement assets pass reload checks.

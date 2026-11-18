@@ -1,0 +1,380 @@
+// Signed distance field of a slate monolith, in normalized rock units. Values below 0 are rock. The output is in meters.
+// The rock is a union of blocks: each bedding layer is a slab of one master hull, and cross joints divide the slab.
+// Every face stays a flat plane: a block has at most two planar cleavage steps, and the lower blocks step in on one side.
+#pragma kernel SlateField
+
+struct SlateLayer
+{
+    float2 shift;
+    float2 lean;
+    float center;
+    int firstJointX;
+    int jointCountX;
+    int firstJointZ;
+    int jointCountZ;
+    int firstStepX;
+    int firstStepZ;
+};
+
+struct SlateChip
+{
+    float4 plane;
+    float3 center;
+    float3 halfSize;
+    float3 axisA;
+    float3 axisB;
+    float depth;
+    int layer;
+};
+
+RWStructuredBuffer<float> _Field;
+StructuredBuffer<float4> _HullPlanes;
+StructuredBuffer<float4> _Beds;
+StructuredBuffer<float> _BedGates;
+StructuredBuffer<SlateLayer> _Layers;
+StructuredBuffer<float4> _Joints;
+StructuredBuffer<float> _Steps;
+StructuredBuffer<SlateChip> _Chips;
+
+int3 _Size;
+int _SliceStart;
+float3 _Origin;
+float _Cell;
+float _WorldScale;
+float3 _Half;
+float2 _Undercut;
+float _UndercutTop;
+float2 _HullLean;
+int _HullPlaneCount;
+int _LayerCount;
+int _ChipCount;
+float _CreaseWidth;
+float _CreaseDepth;
+float _SeamWander;
+int _Seed;
+
+// Shells outside this distance from the master hull cannot change, so they keep the hull value.
+#define BAND 0.12
+// Rock below this height can be removed deep inside the hull, by the ledges of the base.
+#define BASAL_LIMIT 0.1
+// Chance that a block continues the block below it, so a tall buttress crosses the seam.
+#define MERGE_CHANCE 0.45
+#define MERGED_SEAM_GATE 0.30
+// Largest turn of a block column, as a slope. Its faces are wedges and not parallel to the hull.
+#define BLOCK_TILT 0.07
+// Depth of the solid core below the hull. It closes the gap between two blocks with opposite steps.
+#define CORE_DEPTH 0.024
+// Half width of the ramp of a cleavage step, about one cell of a 5 cm grid, so the lip stays sharp and the mesh does not tear.
+#define STEP_RAMP 0.0035
+#define JOINT_JOG 0.011
+// Two blocks overlap by this much, so a seam has no open sheet inside the rock.
+#define OVERLAP 0.003
+#define HULL_SMOOTH 0.003
+#define CHIP_SMOOTH 0.0025
+
+// Two noise values for the joints at this sample. All joints of a sample share them, so a dog leg costs no noise per joint.
+static float _jogA;
+static float _jogB;
+// The rough bend of the cleavage steps at this sample. All blocks of a sample share it, for the same reason.
+static float _stepBend;
+
+float SmoothMax(float a, float b, float k)
+{
+    float h = max(k - abs(a - b), 0.0);
+    return max(a, b) + h * h * 0.25 / k;
+}
+
+float SdBox(float3 p, float3 b)
+{
+    float3 q = abs(p) - b;
+    return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+}
+
+uint Hash(uint3 value)
+{
+    value = value * 1664525u + 1013904223u;
+    value.x += value.y * value.z;
+    value.y += value.z * value.x;
+    value.z += value.x * value.y;
+    value ^= value >> 16;
+    value.x += value.y * value.z;
+    return value.x;
+}
+
+float Hash01(uint3 value)
+{
+    return float(Hash(value) & 0xFFFFFFu) / 16777215.0;
+}
+
+float Lattice(int3 cell, int seed)
+{
+    return float(Hash(uint3(cell + 4096 + seed * 17)) & 0xFFFFFF) / 8388607.5 - 1.0;
+}
+
+// Value noise with a range of about -1 to 1.
+float Noise3(float3 p, int seed)
+{
+    int3 cell = int3(floor(p));
+    float3 f = p - floor(p);
+    float3 u = f * f * (3.0 - 2.0 * f);
+    float x00 = lerp(Lattice(cell, seed), Lattice(cell + int3(1, 0, 0), seed), u.x);
+    float x10 = lerp(Lattice(cell + int3(0, 1, 0), seed), Lattice(cell + int3(1, 1, 0), seed), u.x);
+    float x01 = lerp(Lattice(cell + int3(0, 0, 1), seed), Lattice(cell + int3(1, 0, 1), seed), u.x);
+    float x11 = lerp(Lattice(cell + int3(0, 1, 1), seed), Lattice(cell + int3(1, 1, 1), seed), u.x);
+    return lerp(lerp(x00, x10, u.y), lerp(x01, x11, u.y), u.z);
+}
+
+float EvaluateMasterHull(float3 p)
+{
+    // The whole monolith leans, so its outline is not an upright box.
+    p.xz -= p.y * _HullLean;
+
+    // A slight flare in the upper half, so the rock is top heavy over its narrow base.
+    float upperFlare = saturate((p.y + 0.12) / (_Half.y + 0.12)) * 0.026;
+    float2 halfXZ = _Half.xz + upperFlare;
+    float hull = SdBox(p, float3(halfXZ.x, _Half.y, halfXZ.y));
+    for (int index = 0; index < _HullPlaneCount; index++)
+    {
+        float4 plane = _HullPlanes[index];
+        hull = SmoothMax(hull, dot(p, plane.xyz) - plane.w, HULL_SMOOTH);
+    }
+    return hull;
+}
+
+float Bed(float3 p, int index, float wander)
+{
+    float4 plane = _Beds[index];
+    return dot(p, plane.xyz) - plane.w + wander;
+}
+
+// A joint dog legs with height, so it is not a straight line across the rock.
+float Joint(float3 p, int index, float wander)
+{
+    float4 plane = _Joints[index];
+    float turn = float(index) * 1.7;
+    float jog = (_jogA * cos(turn) + _jogB * sin(turn)) * JOINT_JOG;
+    return dot(p, plane.xyz) - plane.w + wander + jog;
+}
+
+bool MergesDown(int layerIndex, int x, int z)
+{
+    if (layerIndex <= 0) return false;
+    uint value = Hash(uint3(uint(layerIndex + 13), uint(x + 29), uint(z + 47 + _Seed * 71)));
+    return float(value & 0xFFFFu) / 65535.0 < MERGE_CHANCE;
+}
+
+float2 BlockTilt(int root, int x, int z)
+{
+    uint first = Hash(uint3(uint(root + 5), uint(x + 19), uint(z + 41 + _Seed * 53)));
+    uint second = Hash(uint3(uint(root + 23), uint(x + 61), uint(z + 89 + _Seed * 97)));
+    return (float2(float(first & 0xFFFFu), float(second & 0xFFFFu)) / 32767.5 - 1.0) * BLOCK_TILT;
+}
+
+// Above 0 the ledge has removed the rock. Lower layers step in on the side of the lean and at that front corner, and the depth grows
+// with depth only, so a lower layer never juts out past the layer above it. The bed walls make the flat undersides.
+float LedgeCut(float3 p, float layerHeight, float variation)
+{
+    float t = saturate((-layerHeight - _UndercutTop) / max(_Half.y - _UndercutTop, 0.15));
+    if (t <= 0.0) return -1e6;
+    float side = _HullLean.x < 0.0 ? -1.0 : 1.0;
+    float ledge = pow(t, 1.45) * (0.82 + 0.18 * variation);
+    float2 local = p.xz - p.y * _HullLean;
+    float wallX = local.x * side - (_Half.x * 1.02 - ledge * _Undercut.x);
+    // The corner wall starts at the corner of the hull, so the top of the overhang has no sudden step.
+    float wallCorner = (local.x * side * 0.78 + local.y * 0.62) - (_Half.x * 0.78 + _Half.z * 0.62 - ledge * _Undercut.y);
+    return max(wallX, wallCorner);
+}
+
+// One column of merged blocks: the hull, moved and turned with the column, inside the walls of its first layer. Only the two
+// ends of the column have bed walls, so no seam crosses it. A joint across X steps the rock along Z, and the reverse.
+float BlockField(float3 p, int layerIndex, int x, int z, float bedWander, float jointWander)
+{
+    int root = layerIndex;
+    while (MergesDown(root, x, z)) root--;
+    int top = layerIndex;
+    while (top + 1 < _LayerCount && MergesDown(top + 1, x, z)) top++;
+
+    SlateLayer layer = _Layers[root];
+    float stepX = _Steps[layer.firstStepX + min(x, layer.jointCountX)];
+    float stepZ = _Steps[layer.firstStepZ + min(z, layer.jointCountZ)];
+    float2 tilt = BlockTilt(root, x, z);
+
+    float3 q = p;
+    q.xz += layer.shift + float2(stepZ, stepX) + (layer.lean + tilt) * (p.y - layer.center);
+    q.z += tilt.x * 0.40 * p.x;
+    q.x -= tilt.y * 0.40 * p.z;
+    float block = EvaluateMasterHull(q);
+
+    // A cleavage step: one rough line from wall to wall, and the rock on one side drops. Each side is a flat plane at its own angle.
+    uint stepHash = Hash(uint3(uint(root + 19), uint(x + 43), uint(z + 67 + _Seed * 89)));
+    if ((stepHash & 1u) != 0u)
+    {
+        float angle = (float((stepHash >> 2) & 0xFFu) / 255.0 - 0.5) * 0.95;
+        float2 slope = float2(sin(angle), cos(angle));
+        float3 stepNormal = normalize(float3(slope.x, slope.y, slope.x * 0.5));
+        float stepHeight = 0.5 * (_Beds[root].w + _Beds[top + 1].w) + (float((stepHash >> 10) & 0xFFu) / 255.0 - 0.5) * 0.05;
+        float stepDistance = dot(p - float3(0.0, stepHeight, 0.0), stepNormal) + _stepBend;
+        float stepSize = (0.004 + 0.008 * float((stepHash >> 18) & 0xFFu) / 255.0) * ((stepHash & (1u << 26)) != 0u ? 1.0 : -1.0);
+        float stepTurn = (float(stepHash >> 27) / 31.0 - 0.5) * 0.16;
+        block += smoothstep(-STEP_RAMP, STEP_RAMP, stepDistance) * (stepSize + stepDistance * stepTurn);
+    }
+
+    // A tall merged column can also part near one of its covered seams.
+    if (top > root)
+    {
+        uint splitHash = Hash(uint3(uint(root + 53), uint(x + 17), uint(z + 97 + _Seed * 41)));
+        float splitSlope = (float(splitHash & 0xFFu) / 255.0 - 0.5) * 0.28;
+        float splitDistance = (p.y - _Beds[root + 1].w) + p.x * splitSlope + bedWander * 0.8;
+        float splitSize = ((splitHash & 256u) != 0u ? 1.0 : -1.0) * 0.0075;
+        block += smoothstep(-STEP_RAMP, STEP_RAMP, splitDistance) * splitSize;
+    }
+
+    // The first layer of the column sets the ledge of all of it, so the wall has no jump at a covered seam.
+    float blockDepth = Hash01(uint3(uint(root + 11), uint(x + 37), uint(z + 83 + _Seed * 19)));
+    block = max(block, LedgeCut(p, layer.center, blockDepth) + jointWander * 0.8);
+
+    block = max(block, -Bed(p, root, bedWander) - OVERLAP);
+    block = max(block, Bed(p, top + 1, bedWander) - OVERLAP);
+    if (x > 0) block = max(block, -Joint(p, layer.firstJointX + x - 1, jointWander) - OVERLAP);
+    if (x < layer.jointCountX) block = max(block, Joint(p, layer.firstJointX + x, jointWander) - OVERLAP);
+    if (z > 0) block = max(block, -Joint(p, layer.firstJointZ + z - 1, jointWander) - OVERLAP);
+    if (z < layer.jointCountZ) block = max(block, Joint(p, layer.firstJointZ + z, jointWander) - OVERLAP);
+    return block;
+}
+
+int JointIndex(float3 p, int first, int count, float wander)
+{
+    int index = 0;
+    for (int joint = 0; joint < count; joint++)
+    {
+        if (Joint(p, first + joint, wander) > 0.0) index = joint + 1;
+    }
+    return index;
+}
+
+// A shallow groove on a seam. The rock above is undercut, so it casts a shadow, and the lower lip stays sharp.
+float Crease(float seam, float gate)
+{
+    float width = seam > 0.0 ? _CreaseWidth * 1.20 : _CreaseWidth * 0.35;
+    return saturate(1.0 - abs(seam) / width) * _CreaseDepth * gate;
+}
+
+float ChipField(float3 p, float surface, SlateChip chip, float bedWander, float jointWander)
+{
+    float3 offset = p - chip.center;
+    float3 axisC = cross(chip.axisA, chip.axisB);
+    float3 local = float3(dot(offset, chip.axisA), dot(offset, chip.axisB), dot(offset, axisC));
+    if (dot(local / (chip.halfSize + 0.02), local / (chip.halfSize + 0.02)) > 4.0) return 1e6;
+
+    // A slow bend only. Fine noise here makes teeth in the mesh.
+    local.xy += float2(Noise3(p * 18.0, _Seed + 11), Noise3(p * 18.0, _Seed + 29)) * 0.004;
+    // The walls of this wedge meet at shallow angles, so a chip leaves no square wall.
+    float3 q = abs(local) / chip.halfSize;
+    float mask = (q.x * 0.65 + q.y * 0.85 + q.z * 0.45 - 1.0) * min(chip.halfSize.x, chip.halfSize.y);
+
+    // A block is a mask: the chip stays in the block of its center, and its border stops on the seam or joint.
+    SlateLayer home = _Layers[chip.layer];
+    if (JointIndex(p, home.firstJointX, home.jointCountX, jointWander) != JointIndex(chip.center, home.firstJointX, home.jointCountX, 0.0)) return 1e6;
+    if (JointIndex(p, home.firstJointZ, home.jointCountZ, jointWander) != JointIndex(chip.center, home.firstJointZ, home.jointCountZ, 0.0)) return 1e6;
+    mask = max(mask, max(-Bed(p, chip.layer, bedWander), Bed(p, chip.layer + 1, bedWander)));
+
+    // Rock leaves where all three hold: above the plane, inside the mask, and less than the limit below the surface. So the
+    // kept rock is the union of the three opposite sets, and the cut can never go deeper than the limit.
+    float keep = dot(p, chip.plane.xyz) - chip.plane.w;
+    keep = min(keep, surface + chip.depth);
+    return min(keep, -mask);
+}
+
+[numthreads(4, 4, 4)]
+void SlateField(uint3 id : SV_DispatchThreadID)
+{
+    id.z += _SliceStart;
+    if (any(id >= uint3(_Size))) return;
+    int index = id.x + _Size.x * (id.y + _Size.y * id.z);
+    float3 p = _Origin + float3(id) * _Cell;
+
+    float hull = EvaluateMasterHull(p);
+    if (hull > BAND || (hull < -BAND && p.y > BASAL_LIMIT))
+    {
+        _Field[index] = hull * _WorldScale;
+        return;
+    }
+
+    // Slow bends, so cleaved faces stay flat and seams stay crisp.
+    float bedWander = _SeamWander * (Noise3(p * 7.0, _Seed) + 0.35 * Noise3(p * 19.0, _Seed + 3));
+    float jointWander = _SeamWander * (Noise3(p * 8.0, _Seed + 5) + 0.35 * Noise3(p * 21.0, _Seed + 7));
+    float jogAcross = (p.x + p.z) * 1.5;
+    _jogA = Noise3(float3(p.y * 2.8, 0.5, jogAcross), _Seed + 101);
+    _jogB = Noise3(float3(p.y * 2.8, 7.5, jogAcross), _Seed + 101);
+    _stepBend = Noise3(p * 9.0, _Seed + 43) * 0.007 + Noise3(p * 27.0, _Seed + 47) * 0.0012;
+
+    int layerIndex = 0;
+    for (int layer = 0; layer < _LayerCount; layer++)
+    {
+        if (Bed(p, layer, bedWander) > 0.0) layerIndex = layer;
+    }
+
+    float rock = 1e6;
+    int low = max(layerIndex - 1, 0);
+    int high = min(layerIndex + 1, _LayerCount - 1);
+    for (int layer = low; layer <= high; layer++)
+    {
+        SlateLayer item = _Layers[layer];
+        int x = JointIndex(p, item.firstJointX, item.jointCountX, jointWander);
+        int z = JointIndex(p, item.firstJointZ, item.jointCountZ, jointWander);
+        int lowX = max(x - 1, 0);
+        int highX = min(x + 1, item.jointCountX);
+        int lowZ = max(z - 1, 0);
+        int highZ = min(z + 1, item.jointCountZ);
+        for (int blockZ = lowZ; blockZ <= highZ; blockZ++)
+        {
+            for (int blockX = lowX; blockX <= highX; blockX++)
+            {
+                rock = min(rock, BlockField(p, layer, blockX, blockZ, bedWander, jointWander));
+            }
+        }
+    }
+
+    // The core sits behind the deepest ledge of its column, or it would fill the overhang.
+    SlateLayer active = _Layers[layerIndex];
+    int activeX = JointIndex(p, active.firstJointX, active.jointCountX, jointWander);
+    int activeZ = JointIndex(p, active.firstJointZ, active.jointCountZ, jointWander);
+    int activeRoot = layerIndex;
+    while (MergesDown(activeRoot, activeX, activeZ)) activeRoot--;
+    rock = min(rock, max(hull + CORE_DEPTH, LedgeCut(p, _Layers[activeRoot].center, 1.0)));
+
+    // Seams and joints of the layer at this point. Each seam fades in and out along its length.
+    float below = Bed(p, layerIndex, bedWander);
+    float above = Bed(p, layerIndex + 1, bedWander);
+    float gateBelow = smoothstep(-0.25, 0.25, Noise3(p * 5.0 + _BedGates[layerIndex], _Seed + 13) + 0.2);
+    float gateAbove = smoothstep(-0.25, 0.25, Noise3(p * 5.0 + _BedGates[layerIndex + 1], _Seed + 13) + 0.2);
+    // A seam fades where a buttress crosses it, so seams end against the buttress.
+    if (MergesDown(layerIndex, activeX, activeZ)) gateBelow *= MERGED_SEAM_GATE;
+    if (layerIndex + 1 < _LayerCount)
+    {
+        SlateLayer upper = _Layers[layerIndex + 1];
+        int upperX = JointIndex(p, upper.firstJointX, upper.jointCountX, jointWander);
+        int upperZ = JointIndex(p, upper.firstJointZ, upper.jointCountZ, jointWander);
+        if (MergesDown(layerIndex + 1, upperX, upperZ)) gateAbove *= MERGED_SEAM_GATE;
+    }
+    float crease = max(Crease(below, gateBelow), Crease(above, gateAbove));
+    // Joints fade too, so a track is not a groove of one depth through all layers.
+    float jointGate = smoothstep(-0.20, 0.35, Noise3(p * 6.0, _Seed + 19) + 0.15);
+    for (int joint = 0; joint < active.jointCountX; joint++)
+    {
+        crease = max(crease, Crease(Joint(p, active.firstJointX + joint, jointWander), jointGate));
+    }
+    for (int joint = 0; joint < active.jointCountZ; joint++)
+    {
+        crease = max(crease, Crease(Joint(p, active.firstJointZ + joint, jointWander), jointGate));
+    }
+    rock += crease;
+
+    float surface = rock;
+    for (int chip = 0; chip < _ChipCount; chip++)
+    {
+        float keep = ChipField(p, surface, _Chips[chip], bedWander, jointWander);
+        if (keep < 1e5) rock = SmoothMax(rock, keep, CHIP_SMOOTH);
+    }
+    _Field[index] = rock * _WorldScale;
+}

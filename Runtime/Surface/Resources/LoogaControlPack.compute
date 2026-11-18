@@ -1,0 +1,91 @@
+// Packs the splat control maps of one terrain into the packed control maps (LoogaPackedControls): the 4 strongest
+// layers of each texel. The index map holds the layer indices / 255, the weight map their weights with a sum of 1. Each
+// mip packs the same mip of the control maps, so a packed mip holds the strongest layers of the filtered control mip.
+#pragma kernel Pack
+
+#define PACK_MAX_CONTROLS 8
+
+Texture2D<float4> _PackControl0;
+Texture2D<float4> _PackControl1;
+Texture2D<float4> _PackControl2;
+Texture2D<float4> _PackControl3;
+Texture2D<float4> _PackControl4;
+Texture2D<float4> _PackControl5;
+Texture2D<float4> _PackControl6;
+Texture2D<float4> _PackControl7;
+RWTexture2D<float4> _PackIndex;
+RWTexture2D<float4> _PackWeight;
+
+int4 _PackSize;   // x width and y height of the mip, z control map count, w mip
+int4 _PackRect;   // Texels of the dispatch in the mip: first x and y, width, height
+
+float4 LoadControl(int control, int2 texel)
+{
+    int3 location = int3(texel, _PackSize.w);
+    switch (control)
+    {
+        case 0: return _PackControl0.Load(location);
+        case 1: return _PackControl1.Load(location);
+        case 2: return _PackControl2.Load(location);
+        case 3: return _PackControl3.Load(location);
+        case 4: return _PackControl4.Load(location);
+        case 5: return _PackControl5.Load(location);
+        case 6: return _PackControl6.Load(location);
+        default: return _PackControl7.Load(location);
+    }
+}
+
+// Sorted insert. On equal weights the higher layer wins, as in the surface shader and the native terrain order.
+void Insert(inout int4 indices, inout float4 weights, int layer, float weight)
+{
+    if (weight <= 0) return;
+
+    if (weight >= weights.x)
+    {
+        weights = float4(weight, weights.xyz);
+        indices = int4(layer, indices.xyz);
+    }
+    else if (weight >= weights.y)
+    {
+        weights.yzw = float3(weight, weights.yz);
+        indices.yzw = int3(layer, indices.yz);
+    }
+    else if (weight >= weights.z)
+    {
+        weights.zw = float2(weight, weights.z);
+        indices.zw = int2(layer, indices.z);
+    }
+    else if (weight >= weights.w)
+    {
+        weights.w = weight;
+        indices.w = layer;
+    }
+}
+
+[numthreads(8, 8, 1)]
+void Pack(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _PackRect.zw)) return;
+
+    int2 texel = _PackRect.xy + (int2)id.xy;
+    if (any(texel >= _PackSize.xy)) return;
+
+    int4 indices = 0;
+    float4 weights = 0;
+    for (int control = 0; control < PACK_MAX_CONTROLS; control++)
+    {
+        if (control >= _PackSize.z) break;
+
+        float4 control4 = LoadControl(control, texel);
+        Insert(indices, weights, control * 4 + 0, control4.x);
+        Insert(indices, weights, control * 4 + 1, control4.y);
+        Insert(indices, weights, control * 4 + 2, control4.z);
+        Insert(indices, weights, control * 4 + 3, control4.w);
+    }
+    // A texel without weight keeps zero weights, so the shader's fallback layer only shows where the whole footprint
+    // has no weight, as with the control maps.
+    float total = dot(weights, 1.0);
+    weights = total > 0 ? weights / total : 0;
+    _PackIndex[texel] = (float4)indices / 255.0;
+    _PackWeight[texel] = weights;
+}

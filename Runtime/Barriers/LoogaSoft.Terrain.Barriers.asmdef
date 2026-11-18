@@ -1,0 +1,11 @@
+{
+  "name": "LoogaSoft.Terrain.Barriers",
+  "rootNamespace": "LoogaSoft.Terrain.Barriers",
+  "references": [
+    "LoogaSoft.Instancing.Runtime",
+    "LoogaSoft.Terrain.Stamps",
+    "Unity.Mathematics",
+    "Unity.Splines"
+  ],
+  "autoReferenced": true
+}

@@ -1,0 +1,22 @@
+{
+    "name": "LoogaSoft.Terrain.ImageDecoding.Editor",
+    "rootNamespace": "LoogaSoft.Terrain.ImageDecoding.Editor",
+    "references": [],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": true,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": false,
+    "defineConstraints": [],
+    "versionDefines": [
+        {
+            "name": "Unity",
+            "expression": "1.0",
+            "define": "STBSHARP_INTERNAL"
+        }
+    ],
+    "noEngineReferences": false
+}

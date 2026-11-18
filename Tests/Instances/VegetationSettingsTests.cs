@@ -9,6 +9,27 @@ namespace LoogaSoft.Terrain.Instances.Tests
 {
     public sealed class VegetationSettingsTests
     {
+        // Before, the provider compared only the detail prefabs, so a size edit kept the old instances until a domain
+        // reload. DetailPrototype.Equals ignores alignToGround.
+        [Test]
+        public void DetailSettingEditsAreChanges()
+        {
+            var original = new DetailPrototype { minWidth = 0.5f, maxWidth = 1f, minHeight = 0.5f, maxHeight = 2f, density = 1f };
+            Assert.IsTrue(TerrainVegetationProvider.SameDetailSettings(original, new DetailPrototype(original)));
+            Action<DetailPrototype>[] edits =
+            {
+                detail => detail.maxHeight = 2.5f, detail => detail.minWidth = 0.4f, detail => detail.density = 1.25f,
+                detail => detail.alignToGround = 0.25f, detail => detail.noiseSeed = 3,
+                detail => detail.healthyColor = Color.red
+            };
+            foreach (Action<DetailPrototype> edit in edits)
+            {
+                var copy = new DetailPrototype(original);
+                edit(copy);
+                Assert.IsFalse(TerrainVegetationProvider.SameDetailSettings(original, copy));
+            }
+        }
+
         [Test]
         public void ResolvesDefaultsAndSelectedSourceFields()
         {
@@ -72,6 +93,39 @@ namespace LoogaSoft.Terrain.Instances.Tests
         }
 
         [Test]
+        public void ObjectPolicyResolvesInstanceQualityAndNotifiesSources()
+        {
+            VegetationSettings settings = ScriptableObject.CreateInstance<VegetationSettings>();
+            GameObject rock = new GameObject("Rock");
+            GameObject tree = new GameObject("Tree");
+            int changes = 0;
+            try
+            {
+                IInstanceQualitySource source = settings;
+                source.Changed += () => changes++;
+                InstanceQualitySettings defaults = InstanceQualitySettings.Default;
+                defaults.ViewDistance = 500;
+                settings.SetDefaults(VegetationKind.Object, defaults);
+                InstanceQualitySettings change = InstanceQualitySettings.Default;
+                change.LodBias = 2;
+                settings.SetOverride(VegetationKind.Object, rock, VegetationQualityFields.LodBias, change);
+
+                Assert.AreEqual(2, changes);
+                Assert.AreEqual(2, source.ResolveInstanceQuality(rock).LodBias);
+                Assert.AreEqual(500, source.ResolveInstanceQuality(rock).ViewDistance);
+                Assert.AreEqual(0, source.ResolveInstanceQuality(tree).LodBias);
+                Assert.AreEqual(0, settings.Resolve(VegetationKind.Tree, rock).LodBias,
+                    "An Object override must not change the Tree category.");
+            }
+            finally
+            {
+                Object.DestroyImmediate(rock);
+                Object.DestroyImmediate(tree);
+                Object.DestroyImmediate(settings);
+            }
+        }
+
+        [Test]
         public void RejectsInvalidRangesAndSourceKinds()
         {
             VegetationSettings settings = ScriptableObject.CreateInstance<VegetationSettings>();
@@ -82,6 +136,8 @@ namespace LoogaSoft.Terrain.Instances.Tests
                 invalid.ViewDistance = float.NaN;
                 Assert.Throws<ArgumentOutOfRangeException>(() => settings.SetDefaults(VegetationKind.Detail, invalid));
                 Assert.Throws<ArgumentException>(() => settings.SetOverride(VegetationKind.Tree,
+                    texture, VegetationQualityFields.ViewDistance, InstanceQualitySettings.Default));
+                Assert.Throws<ArgumentException>(() => settings.SetOverride(VegetationKind.Object,
                     texture, VegetationQualityFields.ViewDistance, InstanceQualitySettings.Default));
             }
             finally

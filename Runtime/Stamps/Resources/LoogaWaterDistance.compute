@@ -1,0 +1,62 @@
+// Looga Stamps water field: exact distance from each field texel to the water edges in its bin, signed by the
+// surface mask (negative inside water), and the water level at the nearest point of the nearest edge.
+#pragma kernel WaterDistance
+
+// x = inside mask, y = highest water surface.
+Texture2D<float2> _Surface;
+RWTexture2D<float2> _Field;
+// World XZ of the first and the second point of each edge.
+StructuredBuffer<float4> _Edges;
+// World height of the first and the second point of each edge.
+StructuredBuffer<float2> _EdgeHeights;
+StructuredBuffer<uint> _BinEdges;
+// x = first entry in _BinEdges, y = entry count.
+StructuredBuffer<uint2> _Bins;
+int _Resolution;
+int _BinCount;
+// xy = world XZ of the field corner, zw = field size in metres.
+float4 _FieldRect;
+float _MaxDistance;
+float _NotFound;
+
+float SegmentDistance(float2 position, float2 a, float2 b, out float along)
+{
+    float2 segment = b - a;
+    along = saturate(dot(position - a, segment) / max(dot(segment, segment), 1e-12));
+    return length(position - (a + segment * along));
+}
+
+// y = water level of the nearest edge in reach. Without an edge in reach: the surface inside water, -not found
+// outside.
+[numthreads(8, 8, 1)]
+void WaterDistance(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _Resolution)) return;
+    float2 uv = (id.xy + 0.5) / _Resolution;
+    float2 position = _FieldRect.xy + uv * _FieldRect.zw;
+    uint2 bin = min((uint2)(uv * _BinCount), (uint)(_BinCount - 1));
+    uint2 range = _Bins[bin.y * _BinCount + bin.x];
+    float nearest = _NotFound;
+    float level = -_NotFound;
+    for (uint i = 0; i < range.y; i++)
+    {
+        uint index = _BinEdges[range.x + i];
+        float4 edge = _Edges[index];
+        float along;
+        float distance = SegmentDistance(position, edge.xy, edge.zw, along);
+        if (distance < nearest)
+        {
+            nearest = distance;
+            float2 heights = _EdgeHeights[index];
+            level = lerp(heights.x, heights.y, along);
+        }
+    }
+    float2 surface = _Surface[id.xy];
+    bool inside = surface.x > 0.5;
+    if (nearest > _MaxDistance)
+    {
+        nearest = _NotFound;
+        level = inside ? surface.y : -_NotFound;
+    }
+    _Field[id.xy] = float2(inside ? -nearest : nearest, level);
+}

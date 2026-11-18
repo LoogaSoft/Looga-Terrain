@@ -55,7 +55,7 @@ namespace LoogaSoft.Terrain.Tests
                         }
                         source.SetPixels(input);
                         source.Apply();
-                        Graphics.Blit(source, compression.Staging(channel));
+                        Graphics.Blit(source, compression.Staging(channel), 0, 0);
                         commands.Clear();
                         compression.Encode(commands, slot);
                         Graphics.ExecuteCommandBuffer(commands);

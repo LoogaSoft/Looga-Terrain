@@ -40,7 +40,7 @@ namespace LoogaSoft.Terrain.Tests
             var controller = controllerObject.AddComponent<LoogaWorldController>();
             controller.SetGeneratedAssetFolder(OutputFolder);
             controller.SetCameras(new[] { cameraObject.GetComponent<Camera>() });
-            controller.ConfigureFeatures(true, true, false, false, false, true, false, false);
+            controller.ConfigureFeatures(true, true, false, false, true, false);
 
             LoogaWorldSetupUtility.Configure(controller);
             LoogaWorldSetupUtility.Configure(controller);
@@ -68,7 +68,7 @@ namespace LoogaSoft.Terrain.Tests
             var controllerObject = new GameObject("Looga World");
             var controller = controllerObject.AddComponent<LoogaWorldController>();
             controller.SetGeneratedAssetFolder(OutputFolder);
-            controller.ConfigureFeatures(true, true, false, false, false, false, false, false);
+            controller.ConfigureFeatures(true, true, false, false, false, false);
 
             LoogaWorldSetupUtility.Configure(controller);
             LoogaWorldSetupUtility.RestoreNative(controller);
@@ -83,7 +83,7 @@ namespace LoogaSoft.Terrain.Tests
             var controllerObject = new GameObject("Looga World");
             var controller = controllerObject.AddComponent<LoogaWorldController>();
             controller.SetGeneratedAssetFolder(OutputFolder);
-            controller.ConfigureFeatures(false, false, false, false, false, false, false, false);
+            controller.ConfigureFeatures(false, false, false, false, false, false);
             controller.SetInstanceRoots(new[] { source }, maxDistance: 250);
 
             LoogaWorldSetupUtility.Configure(controller);
@@ -107,7 +107,7 @@ namespace LoogaSoft.Terrain.Tests
             var controllerObject = new GameObject("Looga World");
             var controller = controllerObject.AddComponent<LoogaWorldController>();
             controller.SetGeneratedAssetFolder(OutputFolder);
-            controller.ConfigureFeatures(true, false, false, false, false, false, false, false);
+            controller.ConfigureFeatures(true, false, false, false, false, false);
             controller.ConfigureVirtualTexturing(true);
 
             LoogaWorldSetupUtility.Configure(controller);

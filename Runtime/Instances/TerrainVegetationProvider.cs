@@ -10,6 +10,8 @@ namespace LoogaSoft.Terrain.Instances
     public sealed class TerrainVegetationProvider : MonoBehaviour, IInstanceSourceAdapter, IAdaptiveQualityTarget
     {
         private static readonly Dictionary<UnityEngine.Terrain, TerrainVegetationProvider> Owners = new();
+        // One warning for each script domain when providers take hidden native foliage without an owner.
+        private static bool _orphanReported;
         [SerializeField, Min(1)] private int _instanceLimit = 250000;
         [SerializeField] private InstanceMaterialProfile _materialProfile;
         [SerializeField] private string _worldSourceId = Guid.NewGuid().ToString("N");
@@ -49,9 +51,19 @@ namespace LoogaSoft.Terrain.Instances
                 unchanged = _editorObservers[i] == observers[i];
             }
             if (unchanged) return;
-            Release();
+            // A running preview keeps its resident cells: the stream reads the observers again on each update. Only the
+            // start of a preview replaces the runtime vegetation. A full reload on each camera change blanked all
+            // foliage when the Game view was maximized, because that hides the Scene view camera.
+            bool running = _editorObservers != null;
+            if (!running)
+            {
+                Release();
+            }
             _editorObservers = (Transform[])observers.Clone();
-            InvalidateAll();
+            if (!running)
+            {
+                InvalidateAll();
+            }
         }
 
         /// <summary>Releases preview resources and restores the previous native foliage visibility.</summary>
@@ -61,6 +73,64 @@ namespace LoogaSoft.Terrain.Instances
             Release();
             _editorObservers = null;
             InvalidateAll();
+        }
+
+        /// <summary>
+        /// Ends the editor preview before a script reload. While Looga draws the terrain, native foliage stays hidden:
+        /// native foliage on all terrains made the editor slow until the new providers loaded. The next script domain
+        /// gives the visibility back with <see cref="AdoptHiddenNativeFoliage"/>.
+        /// </summary>
+        /// <returns>True when native foliage stays hidden. <paramref name="nativeState"/> is the visibility to restore.</returns>
+        public bool EndEditorPreviewForReload(out bool nativeState)
+        {
+            nativeState = _nativeState;
+            if (_editorObservers == null || !_ownsNativeState || !_terrain || !IsRendering ||
+                _terrain.drawTreesAndFoliage)
+            {
+                EndEditorPreview();
+                return false;
+            }
+            Release(false);
+            _editorObservers = null;
+            InvalidateAll();
+            return true;
+        }
+
+        /// <summary>
+        /// Takes the native foliage visibility that <see cref="EndEditorPreviewForReload"/> kept hidden. Native foliage
+        /// stays hidden until the stream draws, and a release restores <paramref name="nativeState"/>.
+        /// </summary>
+        public void AdoptHiddenNativeFoliage(bool nativeState)
+        {
+            if (_ownsNativeState || !_terrain || _terrain.drawTreesAndFoliage) return;
+            _nativeState = nativeState;
+            _ownsNativeState = true;
+            _hideNativeWhileLoading = true;
+            Owners[_terrain] = this;
+        }
+
+        /// <summary>
+        /// Writes the native foliage visibility back to the terrain, for example while a scene saves. The loaded
+        /// vegetation stays. Call <see cref="ReclaimNativeFoliage"/> after the save.
+        /// </summary>
+        public void RestoreNativeFoliage()
+        {
+            if (_ownsNativeState && _terrain)
+            {
+                _terrain.drawTreesAndFoliage = _nativeState;
+            }
+        }
+
+        /// <summary>
+        /// Hides native foliage again while Looga draws this terrain: after a scene save, or after an undo that restored
+        /// an older terrain state.
+        /// </summary>
+        public void ReclaimNativeFoliage()
+        {
+            if (_ownsNativeState && _terrain && IsRendering)
+            {
+                _terrain.drawTreesAndFoliage = false;
+            }
         }
 #endif
 
@@ -172,16 +242,30 @@ namespace LoogaSoft.Terrain.Instances
         public Vector3 LastStreamingObserverPosition => _stream?.ObserverPosition ?? new Vector3(float.PositiveInfinity, 0f, 0f);
         private bool _nativeState;
         private bool _ownsNativeState;
+        // Native foliage stays hidden until the stream draws. An editor script reload and hidden foliage without an
+        // owner set it.
+        private bool _hideNativeWhileLoading;
         private bool _fullRefresh;
         private bool _heightPending;
         private string _qualityDiagnostic = string.Empty;
         private bool _surfaceDirty;
         private bool _treesDirty;
+        // Terrain-local XZ areas whose trees a height change moved. Only their tree cells load again.
+        private readonly List<Rect> _dirtyTreeAreas = new();
         private Vector3 _position;
         private float _density;
         private int _treeCount;
         private UnityEngine.Object[] _treeSources = Array.Empty<UnityEngine.Object>();
         private UnityEngine.Object[] _detailSources = Array.Empty<UnityEngine.Object>();
+        // Copies of the detail prototypes that the current vegetation uses. A size or density edit changes placements.
+        private DetailPrototype[] _detailSettings = Array.Empty<DetailPrototype>();
+        // TerrainData returns new prototype arrays on each read. The provider compares the prototypes only after a
+        // terrain change message or an enable. In the editor, a TerrainData dirty count change also starts the
+        // comparison. Undo does not send the terrain change message.
+        private bool _prototypesMayChange = true;
+#if UNITY_EDITOR
+        private int _dataDirtyCount = -1;
+#endif
 
         /// <summary>Reason for native fallback, or an empty string while Looga owns rendering.</summary>
         public string Diagnostic { get; private set; } = string.Empty;
@@ -332,6 +416,7 @@ namespace LoogaSoft.Terrain.Instances
             TerrainCallbacks.heightmapChanged += OnHeightChanged;
             TerrainCallbacks.textureChanged += OnTextureChanged;
             _fullRefresh = true;
+            _prototypesMayChange = true;
         }
 
         private void OnDisable()
@@ -352,6 +437,12 @@ namespace LoogaSoft.Terrain.Instances
             InvalidateAll();
         }
 
+        // The Terrain sends this message after TerrainData setters, for example a new prototype array.
+        private void OnTerrainChanged(TerrainChangedFlags flags)
+        {
+            _prototypesMayChange = true;
+        }
+
         private void LateUpdate()
         {
             if (!Application.IsPlaying(gameObject))
@@ -368,7 +459,10 @@ namespace LoogaSoft.Terrain.Instances
         #endregion
 
         #region Source updates
-        /// <summary>Enable bounded cell residency around all assigned observers. Missing required cells use native rendering.</summary>
+        /// <summary>
+        /// Enable bounded cell residency around all assigned observers. Native rendering stays active until all required
+        /// cells load. GPU-resident details then keep drawing the loaded cells while missing cells load or wait for space.
+        /// </summary>
         public void ConfigureStreaming(Transform[] observers, int cellsPerUpdate = 4, float prefetchMargin = 32, int residentCells = 256)
         {
             if (observers == null || observers.Length == 0 || cellsPerUpdate < 1 || residentCells < 1 ||
@@ -504,13 +598,6 @@ namespace LoogaSoft.Terrain.Instances
                     Release(!_externalOwner);
                     return false;
                 }
-                if (_heightPending)
-                {
-                    Release();
-                    _fullRefresh = true;
-                    Diagnostic = "Waiting for native terrain height synchronization.";
-                    return false;
-                }
                 TerrainData data = _terrain.terrainData;
                 if (_data != data || _position != _terrain.transform.position || _density != _terrain.detailObjectDensity)
                 {
@@ -523,6 +610,15 @@ namespace LoogaSoft.Terrain.Instances
                 if (_treeCount != data.treeInstanceCount)
                 {
                     _treesDirty = true;
+                }
+                // Placements read the CPU heights, which are old until the synchronization. Vegetation that Looga already
+                // draws stays until then, and the changed patches load after it. A full rebuild must wait.
+                if (_heightPending && (_fullRefresh || _treesDirty || !IsRendering))
+                {
+                    Release();
+                    _fullRefresh = true;
+                    Diagnostic = "Waiting for native terrain height synchronization.";
+                    return false;
                 }
                 bool streaming = _streaming;
                 Transform[] observers = _observers;
@@ -542,12 +638,16 @@ namespace LoogaSoft.Terrain.Instances
                         _fullRefresh = true;
                     }
                     IVegetationPageSource activePageSource = gpuDetails ? null : GetPageSource();
-                    if (_surfaceDirty && !_fullRefresh && !_treesDirty && activePageSource is GeneratedVegetationPageSource surfaceSource)
+                    if (!_heightPending)
                     {
-                        // Affected page requests are cancelled below; unrelated requests keep their snapshot.
-                        surfaceSource.RefreshSurface(false);
+                        if (_surfaceDirty && !_fullRefresh && !_treesDirty &&
+                            activePageSource is GeneratedVegetationPageSource surfaceSource)
+                        {
+                            // Affected page requests are cancelled below; unrelated requests keep their snapshot.
+                            surfaceSource.RefreshSurface(false);
+                        }
+                        _surfaceDirty = false;
                     }
-                    _surfaceDirty = false;
                     if ((_stream?.IsRendering ?? false) && _terrain.drawTreesAndFoliage)
                     {
                         Release();
@@ -580,14 +680,22 @@ namespace LoogaSoft.Terrain.Instances
                         _fullRefresh = false;
                     }
                     if (_stream == null) return false;
-                    foreach (Vector2Int patch in _dirtyPatches)
+                    if (!_heightPending)
                     {
-                        _stream.Invalidate(patch);
+                        foreach (Vector2Int patch in _dirtyPatches)
+                        {
+                            _stream.Invalidate(patch);
+                        }
+                        _dirtyPatches.Clear();
+                        if (_dirtyTreeAreas.Count > 0)
+                        {
+                            _stream.RefreshTrees(_dirtyTreeAreas);
+                            _dirtyTreeAreas.Clear();
+                        }
                     }
                     if (!_ownsNativeState)
                     {
-                        _nativeState = _terrain.drawTreesAndFoliage;
-                        _ownsNativeState = true;
+                        TakeNativeState();
                         Owners[_terrain] = this;
                     }
                     VegetationStreamingBudget updateBudget = _streamingBudget;
@@ -600,12 +708,23 @@ namespace LoogaSoft.Terrain.Instances
 #endif
                     bool ready = _stream.Update(observers, _prefetchMargin, _cellsPerUpdate,
                         _shadowDistance, _minimumShadowLod, updateBudget);
-                    _terrain.drawTreesAndFoliage = _stream.IsRendering ? false : _nativeState;
+                    if (_stream.IsRendering)
+                    {
+                        _hideNativeWhileLoading = false;
+                    }
+                    _terrain.drawTreesAndFoliage = _stream.IsRendering || _hideNativeWhileLoading ? false : _nativeState;
                     _treesDirty = false;
-                    _dirtyPatches.Clear();
                     LastPatchReads = _stream.PatchReads;
-                    Diagnostic = ready ? _qualityDiagnostic : _stream.IsRendering ?
+                    Diagnostic = _heightPending ?
+                        "Waiting for native terrain height synchronization. Looga draws the previous vegetation." :
+                        ready ? _qualityDiagnostic : _stream.BudgetLimited ?
+                        (_stream.IsRendering ?
+                            "Required vegetation exceeds the resident instance limit, cell limit or GPU reservation. Missing cells stay empty until evictions free space." :
+                            "Required vegetation exceeds the resident instance limit, cell limit or GPU reservation. Native rendering remains active.") :
+                        _stream.IsRendering ?
                         "Required vegetation cells are loading. Looga draws the loaded cells." :
+                        _hideNativeWhileLoading ?
+                        "Required vegetation cells are loading after a script reload. Native foliage stays hidden." :
                         "Required vegetation cells are loading. Native rendering remains active.";
                     return ready;
                 }
@@ -629,9 +748,9 @@ namespace LoogaSoft.Terrain.Instances
                     Rebuild(data);
                     CapturePrototypeSources(data);
                 }
-                else if (_population != null)
+                else if (_population != null && !_heightPending)
                 {
-                    if (_treesDirty)
+                    if (_treesDirty || _dirtyTreeAreas.Count > 0)
                     {
                         ReplaceTrees(_population, data);
                     }
@@ -647,9 +766,11 @@ namespace LoogaSoft.Terrain.Instances
                 _population.Details.MaxDistance = _terrain.detailObjectDistance;
                 _population.Trees.ShadowDistance = _population.Details.ShadowDistance = _shadowDistance;
                 _population.Trees.MinimumShadowLod = _population.Details.MinimumShadowLod = _minimumShadowLod;
+                if (_heightPending) return true;
                 _treeCount = data.treeInstanceCount;
                 _treesDirty = false;
                 _dirtyPatches.Clear();
+                _dirtyTreeAreas.Clear();
                 Diagnostic = _qualityDiagnostic;
                 return true;
             }
@@ -659,11 +780,29 @@ namespace LoogaSoft.Terrain.Instances
                 _fullRefresh = false;
                 _treesDirty = false;
                 _dirtyPatches.Clear();
+                _dirtyTreeAreas.Clear();
                 Diagnostic = exception.Message;
                 return false;
             }
         }
         #endregion
+
+        // Takes the native foliage visibility before the provider hides it. Hidden native foliage without an owner is left
+        // over from an interrupted handover, for example a script reload or a scene save in the editor: Looga providers
+        // and vendor components that own it were checked first (GetBlock). The provider then takes it as visible and keeps
+        // it hidden while the vegetation loads. Before, the provider waited for an owner that did not exist.
+        private void TakeNativeState()
+        {
+            bool orphaned = !_terrain.drawTreesAndFoliage;
+            _nativeState = true;
+            _ownsNativeState = true;
+            if (!orphaned) return;
+            _hideNativeWhileLoading = true;
+            if (_orphanReported) return;
+            _orphanReported = true;
+            Debug.LogWarning("Looga vegetation took hidden native foliage that no owner held on " + _terrain.name +
+                " and will restore it as visible. Other terrains may follow without a message.", _terrain);
+        }
 
         private string GetBlock()
         {
@@ -689,7 +828,6 @@ namespace LoogaSoft.Terrain.Instances
                     return "An active vendor vegetation component already uses this terrain: " + type;
                 }
             }
-            if (!_ownsNativeState && !_terrain.drawTreesAndFoliage) return "Native vegetation is already disabled by another owner.";
             return null;
         }
 
@@ -723,24 +861,56 @@ namespace LoogaSoft.Terrain.Instances
 
         private bool PrototypeSourcesChanged(TerrainData data)
         {
+#if UNITY_EDITOR
+            int dirtyCount = UnityEditor.EditorUtility.GetDirtyCount(data);
+            if (dirtyCount != _dataDirtyCount)
+            {
+                _dataDirtyCount = dirtyCount;
+                _prototypesMayChange = true;
+            }
+#endif
+            if (!_prototypesMayChange) return false;
+            _prototypesMayChange = false;
             TreePrototype[] trees = data.treePrototypes;
             DetailPrototype[] details = data.detailPrototypes;
             if (trees.Length != _treeSources.Length || details.Length != _detailSources.Length) return true;
             for (int i = 0; i < trees.Length; i++)
                 if (trees[i].prefab != _treeSources[i]) return true;
             for (int i = 0; i < details.Length; i++)
-                if (DetailSource(details[i]) != _detailSources[i]) return true;
+                if (DetailSource(details[i]) != _detailSources[i] || !SameDetailSettings(details[i], _detailSettings[i]))
+                    return true;
             return false;
+        }
+
+        /// <summary>
+        /// True when two detail prototypes place and color the same instances. DetailPrototype.Equals ignores some of
+        /// these settings, for example alignToGround.
+        /// </summary>
+        internal static bool SameDetailSettings(DetailPrototype a, DetailPrototype b)
+        {
+            return a.prototype == b.prototype && a.prototypeTexture == b.prototypeTexture &&
+                a.usePrototypeMesh == b.usePrototypeMesh && a.renderMode == b.renderMode &&
+                a.useInstancing == b.useInstancing && a.minWidth == b.minWidth && a.maxWidth == b.maxWidth &&
+                a.minHeight == b.minHeight && a.maxHeight == b.maxHeight && a.density == b.density &&
+                a.noiseSeed == b.noiseSeed && a.noiseSpread == b.noiseSpread && a.holeEdgePadding == b.holeEdgePadding &&
+                a.alignToGround == b.alignToGround && a.positionJitter == b.positionJitter &&
+                a.targetCoverage == b.targetCoverage && a.useDensityScaling == b.useDensityScaling &&
+                a.healthyColor == b.healthyColor && a.dryColor == b.dryColor;
         }
 
         private void CapturePrototypeSources(TerrainData data)
         {
+            _prototypesMayChange = false;
+#if UNITY_EDITOR
+            _dataDirtyCount = UnityEditor.EditorUtility.GetDirtyCount(data);
+#endif
             TreePrototype[] trees = data.treePrototypes;
             DetailPrototype[] details = data.detailPrototypes;
             _treeSources = new UnityEngine.Object[trees.Length];
             _detailSources = new UnityEngine.Object[details.Length];
             for (int i = 0; i < trees.Length; i++) _treeSources[i] = trees[i].prefab;
             for (int i = 0; i < details.Length; i++) _detailSources[i] = DetailSource(details[i]);
+            _detailSettings = Array.ConvertAll(details, detail => new DetailPrototype(detail));
         }
 
         private void OnVegetationSettingsChanged()
@@ -847,8 +1017,7 @@ namespace LoogaSoft.Terrain.Instances
                 next.Details.Flush();
                 if (!_ownsNativeState)
                 {
-                    _nativeState = _terrain.drawTreesAndFoliage;
-                    _ownsNativeState = true;
+                    TakeNativeState();
                 }
                 _population?.Dispose();
                 _population = next;
@@ -903,6 +1072,7 @@ namespace LoogaSoft.Terrain.Instances
             Vector3 origin = _terrain.transform.position;
             for (int layer = 0; layer < population.DetailTypes.Length; layer++)
             {
+                if (ReplacedDetailLayers.IsReplaced(_terrain, layer)) continue;
                 DetailInstanceTransform[] transforms = data.ComputeDetailInstanceTransforms(patch.x, patch.y, layer,
                     _terrain.detailObjectDensity, out _);
                 CheckLimit(population.Count - (old?.Count ?? 0) + next.Count + transforms.Length);
@@ -954,7 +1124,14 @@ namespace LoogaSoft.Terrain.Instances
             float scale = data.detailResolution / (float)(data.heightmapResolution - 1);
             InvalidateDetails(new RectInt(Mathf.FloorToInt((region.xMin - 1) * scale), Mathf.FloorToInt((region.yMin - 1) * scale),
                 Mathf.CeilToInt((region.width + 2) * scale) + 1, Mathf.CeilToInt((region.height + 2) * scale) + 1));
-            _treesDirty = true;
+            // Trees stand on the ground, so the tree cells in the changed area load again with their new heights.
+            if (data.treeInstanceCount > 0)
+            {
+                float cellX = data.size.x / (data.heightmapResolution - 1);
+                float cellZ = data.size.z / (data.heightmapResolution - 1);
+                _dirtyTreeAreas.Add(Rect.MinMaxRect((region.xMin - 1) * cellX, (region.yMin - 1) * cellZ,
+                    (region.xMax + 1) * cellX, (region.yMax + 1) * cellZ));
+            }
         }
 
         private void OnTextureChanged(UnityEngine.Terrain terrain, string textureName, RectInt region, bool synchronized)
@@ -987,6 +1164,7 @@ namespace LoogaSoft.Terrain.Instances
                 Owners.Remove(_terrain);
             }
             _ownsNativeState = false;
+            _hideNativeWhileLoading = false;
         }
 
         private sealed class Population : IDisposable

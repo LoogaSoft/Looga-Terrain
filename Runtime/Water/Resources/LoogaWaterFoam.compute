@@ -1,0 +1,203 @@
+// One step of the persistent foam of a Looga water body. The foam moves with the flow of the shore map, collects
+// where the flow converges, fades over its lifetime and rises toward the sources: the shore band, fast water and
+// the impact lines where falling water lands.
+#pragma kernel Step
+
+#include "Packages/com.loogasoft.loogaterrain/Runtime/Water/Shaders/LoogaWaterFoam.hlsl"
+
+Texture2D<float> _Previous;
+RWTexture2D<float> _Result;
+// R = signed distance to the water edge, G = depth (-1 outside the mesh), BA = world XZ flow.
+Texture2D<float4> _ShoreMap;
+// R = turbulence, G = aeration of the flow regime of a water network, 0 to 1, in the shore map layout.
+Texture2D<float2> _RegimeMap;
+// White water of the aeration, 0 = off.
+float _RegimeWhiteWater;
+Texture2D<float4> _FoamDetailMap;
+SamplerState sampler_linear_clamp;
+SamplerState sampler_linear_repeat;
+
+// xy = world XZ origin of the window, z = texel size in metres.
+float4 _Window;
+// The window of the previous step: xy = origin, zw = 1 / size. Zero = no previous foam.
+float4 _PreviousWindow;
+// Rectangle whose texels keep their foam in this step (xy = origin, zw = 1 / size), for the warm-up of the water that
+// a moved window uncovers. Zero = none.
+float4 _Kept;
+uint2 _Size;
+// xy = world XZ origin of the shore map, zw = 1 / size.
+float4 _ShoreMapRect;
+// Foam of the body upstream (LoogaWaterBody Inflow From), for foam that comes in past the outline.
+// xy = world XZ origin, zw = 1 / size. Zero = no upstream foam.
+Texture2D<float> _Inflow;
+float4 _InflowRect;
+float _DeltaTime;
+float _SimulationTime;
+// exp(-dt / lifetime) and 1 - exp(-dt / rise time).
+float _Decay;
+float _Rise;
+float _Convergence;
+float _FoamDetailSize;
+float _ShoreFoamWidth;
+float _ShoreFoam;
+float _ShoreFoamPulse;
+float _FastSpeed;
+float _FastFoam;
+float _FastFoamStart;
+// Impact lines: xy = start, zw = end of a segment in world XZ.
+StructuredBuffer<float4> _Impacts;
+// Strength of each impact segment, from 0 to 1.
+StructuredBuffer<float> _ImpactStrengths;
+uint _ImpactCount;
+
+float2 Rotate(float2 value, float angle)
+{
+    float s, c;
+    sincos(angle, s, c);
+    return float2(c * value.x - s * value.y, s * value.x + c * value.y);
+}
+
+float4 Shore(float2 world)
+{
+    return _ShoreMap.SampleLevel(sampler_linear_clamp, (world - _ShoreMapRect.xy) * _ShoreMapRect.zw, 0);
+}
+
+// Distances from an impact line where the boil is full and where it ends, in metres. Up to the spread distance, the
+// flow spreads because water comes in from above, so the foam does not thin there.
+static const float ImpactFull = 1.5;
+static const float ImpactReach = 5.0;
+static const float ImpactSpread = 15.0;
+
+// White water where falling water lands: dense foam that boils up in churning patches and comes in surges. The
+// outflow carries the surges away from the impact as bands and patches. Values above 1 are dense foam that lasts
+// longer. near: 1 at the impact line, 0 past the spread distance.
+float ImpactFoam(float2 world, out float near)
+{
+    float impact = 0;
+    near = 0;
+    for (uint index = 0; index < _ImpactCount; index++)
+    {
+        float4 segment = _Impacts[index];
+        float2 along = segment.zw - segment.xy;
+        float t = saturate(dot(world - segment.xy, along) / max(dot(along, along), 1e-4));
+        float distance = length(world - (segment.xy + along * t));
+        impact = max(impact, (1 - smoothstep(ImpactFull, ImpactReach, distance)) * _ImpactStrengths[index]);
+        near = max(near, 1 - smoothstep(ImpactReach, ImpactSpread, distance));
+    }
+    if (impact <= 0) return 0;
+
+    // Two samples that drift against each other churn the patches in place. The surge phase changes along the line,
+    // so the full impact does not pulse at the same time.
+    float churnA = _FoamDetailMap.SampleLevel(sampler_linear_repeat,
+        Rotate(world, 0.6) / (_FoamDetailSize * 1.6) + float2(0.13, 0.07) * _SimulationTime, 2).r;
+    float churnB = _FoamDetailMap.SampleLevel(sampler_linear_repeat,
+        Rotate(world, -2.2) / (_FoamDetailSize * 2.3) - float2(0.05, 0.11) * _SimulationTime, 2).r;
+    float surge = 0.55 + 0.45 * sin(_SimulationTime * 2.1 + churnB * 6.0);
+    float patches = smoothstep(0.3, 0.75, churnA * churnB * 2.0 * surge + 0.1);
+    return impact * lerp(0.8, 1.6, patches);
+}
+
+// Cycle of the fast water spots, in seconds: they move with the flow and blend over to a new place each half cycle.
+static const float SpotCycle = 2.0;
+
+// Spot value from 0 to 1: two turned octaves of noise that does not repeat. Spots from the tiling detail texture were
+// spaced in a grid, and the flow drew them out into rows of equal trails.
+float Spots(float2 world)
+{
+    float coarse = LoogaFoamNoise(Rotate(world, 0.9) / (_FoamDetailSize * 0.7)).x;
+    float fine = LoogaFoamNoise(Rotate(world, -1.7) / (_FoamDetailSize * 0.37) + 57.3).y;
+    return coarse * 0.65 + fine * 0.35;
+}
+
+// Foam that the sources keep at a point: the same shore band as the water shader. Fast water makes foam in spots
+// (small clumps of the detail texture) that move with the flow, and the flow draws the spots out into trails. Fixed
+// spots made trails that stayed in place. The aeration of rapids and cascades makes dense white water with the same
+// moving spots, so it breaks up into trails downstream.
+float Target(float2 world, float4 shore)
+{
+    float clumps = _FoamDetailMap.SampleLevel(sampler_linear_repeat, LoogaFoamPatchUV(world, _FoamDetailSize), 3).r;
+    float patches = LoogaFoamPatches(clumps);
+    float band = LoogaShoreBand(shore.r, patches, _SimulationTime, _ShoreFoamWidth, _ShoreFoamPulse) * _ShoreFoam;
+    float speed = saturate((length(shore.ba) - _FastFoamStart) / max(_FastSpeed, 0.01));
+    float aeration = _RegimeMap.SampleLevel(sampler_linear_clamp, (world - _ShoreMapRect.xy) * _ShoreMapRect.zw, 0).g *
+        _RegimeWhiteWater;
+    if (speed <= 0 && aeration <= 0) return band;
+
+    float phase0 = frac(_SimulationTime / SpotCycle);
+    float phase1 = frac(phase0 + 0.5);
+    float weight0 = 1 - abs(1 - 2 * phase0);
+    float moving = Spots(world - shore.ba * ((phase0 - 0.5) * SpotCycle)) * weight0 +
+        Spots(world - shore.ba * ((phase1 - 0.5) * SpotCycle)) * (1 - weight0);
+    float spots = smoothstep(0.5, 0.75, moving);
+    float whiteWater = aeration * lerp(0.3, 1.4, smoothstep(0.35, 0.8, moving));
+    return max(max(band, speed * _FastFoam * 1.6 * spots), whiteWater);
+}
+
+// Foam of the upstream body one texel upstream of a point, so the sample stays inside its surface. False when the
+// upstream foam does not cover the point.
+bool UpstreamFoam(float2 world, float2 flow, out float foam)
+{
+    foam = 0;
+    float2 uv = (world - normalize(flow) * _Window.z - _InflowRect.xy) * _InflowRect.zw;
+    if (_InflowRect.z <= 0 || any(uv <= 0) || any(uv >= 1)) return false;
+    foam = _Inflow.SampleLevel(sampler_linear_clamp, uv, 0);
+    return true;
+}
+
+[numthreads(8, 8, 1)]
+void Step(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= _Size)) return;
+
+    float2 world = _Window.xy + (id.xy + 0.5) * _Window.z;
+    // Foam in the kept rectangle does not change. The windows are aligned to whole texels, so the sample is the texel.
+    if (_Kept.z > 0)
+    {
+        float2 keptUV = (world - _Kept.xy) * _Kept.zw;
+        if (all(keptUV > 0) && all(keptUV < 1))
+        {
+            float2 sourceUV = (world - _PreviousWindow.xy) * _PreviousWindow.zw;
+            _Result[id.xy] = _Previous.SampleLevel(sampler_linear_clamp, sourceUV, 0);
+            return;
+        }
+    }
+    float4 shore = Shore(world);
+    if (shore.g < -0.5)
+    {
+        // Outside the mesh this body has no foam. Open water there (flow past the outline) holds the foam of the
+        // upstream body, so the foam that flows in across a joint is not thinned by empty texels.
+        float upstream = 0;
+        if (dot(shore.ba, shore.ba) > 1e-4) UpstreamFoam(world, shore.ba, upstream);
+        _Result[id.xy] = upstream;
+        return;
+    }
+
+    // The foam here came from upstream (semi-Lagrangian advection). Outside the previous window, for example after
+    // the window moved, the foam starts at the source value.
+    float2 back = world - shore.ba * _DeltaTime;
+    float2 previousUV = (back - _PreviousWindow.xy) * _PreviousWindow.zw;
+    bool inside = all(previousUV > 0) && all(previousUV < 1);
+    float backNear;
+    float foam = inside ? _Previous.SampleLevel(sampler_linear_clamp, previousUV, 0) :
+        max(Target(back, Shore(back)), ImpactFoam(back, backNear));
+
+    // Flow that converges (negative divergence) gathers the foam into lines. Flow that spreads thins it. The samples
+    // are one shore map texel apart: the flow is bilinear between texels, so a shorter step gives a divergence that
+    // jumps at each texel edge, and the foam showed bands with hard sides.
+    uint shoreWidth, shoreHeight;
+    _ShoreMap.GetDimensions(shoreWidth, shoreHeight);
+    float step = max(_Window.z, 1.0 / (_ShoreMapRect.z * shoreWidth));
+    float divergence = (Shore(world + float2(step, 0)).b - Shore(world - float2(step, 0)).b +
+        Shore(world + float2(0, step)).a - Shore(world - float2(0, step)).a) / (2 * step);
+    float near;
+    float impact = ImpactFoam(world, near);
+    foam *= exp(-clamp(divergence * _DeltaTime * _Convergence, -0.5, 0.5) * (1 - near));
+    foam *= _Decay;
+
+    // The sources raise the foam toward their value. They do not remove foam above it.
+    float target = Target(world, shore);
+    if (target > foam) foam = lerp(foam, target, _Rise);
+    // Falling water makes its foam at once. A slow rise would let a fast outflow carry the foam away before it forms.
+    foam = max(foam, impact);
+    _Result[id.xy] = clamp(foam, 0, 2);
+}
